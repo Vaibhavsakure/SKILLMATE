@@ -1,0 +1,239 @@
+# ============================================================
+# Skillmate AI — Docker Compose (Development)
+# ============================================================
+# Usage:
+#   docker compose up -d          → Start all services
+#   docker compose logs -f        → Tail logs
+#   docker compose down           → Stop all services
+#
+# Services:
+#   postgres   — PostgreSQL 16 (port 5432)
+#   redis      — Redis 7 (port 6379)
+#   backend    — FastAPI (port 8000)
+#   frontend   — Next.js (port 3000)
+# ============================================================
+
+services:
+  # ── PostgreSQL Database ──────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: skillmate-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-skillmate}
+      POSTGRES_USER: ${POSTGRES_USER:-skillmate}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-skillmate_dev_password}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-skillmate} -d ${POSTGRES_DB:-skillmate}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - skillmate-network
+
+  # ── Redis (Cache / Task Queue) ───────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: skillmate-redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - skillmate-network
+
+  # ── FastAPI Backend ──────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: skillmate-backend
+    restart: unless-stopped
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    environment:
+      # General
+      ENV: ${ENV:-development}
+      DEBUG: ${DEBUG:-true}
+      SECRET_KEY: ${SECRET_KEY:-}
+
+      # Database — points to the postgres service
+      DATABASE_URL: postgresql://${POSTGRES_USER:-skillmate}:${POSTGRES_PASSWORD:-skillmate_dev_password}@postgres:5432/${POSTGRES_DB:-skillmate}
+
+      # Supabase
+      SUPABASE_URL: ${SUPABASE_URL:-}
+      SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY:-}
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:-}
+      ALLOW_DEV_MOCK_AUTH: ${ALLOW_DEV_MOCK_AUTH:-false}
+
+      # AI Providers
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+
+      # Stripe
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      STRIPE_PUBLISHABLE_KEY: ${STRIPE_PUBLISHABLE_KEY:-}
+
+      # Frontend URL (for Stripe redirects, CORS, etc.)
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
+      CORS_ORIGINS: '["http://localhost:3000","http://127.0.0.1:3000","http://frontend:3000"]'
+
+      # Redis
+      REDIS_URL: redis://redis:6379/0
+
+      # File Upload
+      MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB:-10}
+      UPLOAD_DIR: /app/uploads
+    volumes:
+      - backend_uploads:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - skillmate-network
+
+  # ── ARQ Background Worker ────────────────────────────────────
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: skillmate-worker
+    restart: unless-stopped
+    command: arq app.workers.worker.WorkerSettings
+    environment:
+      # General
+      ENV: ${ENV:-development}
+      SECRET_KEY: ${SECRET_KEY:-}
+
+      # Database
+      DATABASE_URL: postgresql://${POSTGRES_USER:-skillmate}:${POSTGRES_PASSWORD:-skillmate_dev_password}@postgres:5432/${POSTGRES_DB:-skillmate}
+
+      # Supabase
+      SUPABASE_URL: ${SUPABASE_URL:-}
+      SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY:-}
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:-}
+
+      # AI Providers
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+
+      # Email (for send_email_bg)
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      EMAIL_FROM: ${EMAIL_FROM:-noreply@skillmate.ai}
+
+      # Redis
+      REDIS_URL: redis://redis:6379/0
+
+      # Frontend URL (for email links)
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - skillmate-network
+
+  # ── Database Backup (cron — daily 2am UTC) ───────────────────
+  backup:
+    image: postgres:16-alpine
+    container_name: skillmate-backup
+    restart: unless-stopped
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        # Install bash for the backup script
+        apk add --no-cache bash > /dev/null 2>&1
+
+        # Make scripts executable
+        chmod +x /scripts/backup.sh /scripts/restore.sh
+
+        # Run an initial backup on container start
+        echo "[backup-init] Running initial backup..."
+        /scripts/backup.sh
+
+        # Set up daily cron at 2:00 AM UTC
+        echo "0 2 * * * /scripts/backup.sh >> /var/log/backup.log 2>&1" | crontab -
+        echo "[backup-init] Cron scheduled: daily at 02:00 UTC"
+
+        # Run crond in foreground (keeps container alive)
+        crond -f -l 2
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: ${POSTGRES_DB:-skillmate}
+      POSTGRES_USER: ${POSTGRES_USER:-skillmate}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-skillmate_dev_password}
+      POSTGRES_PORT: "5432"
+      BACKUP_DIR: /backups
+      RETENTION_DAYS: "7"
+    volumes:
+      - db_backups:/backups
+      - ./scripts:/scripts:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - skillmate-network
+
+  # ── Next.js Frontend ─────────────────────────────────────────
+  frontend:
+    build:
+      context: ./skillmate-frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:-}
+        NEXT_PUBLIC_SUPABASE_ANON_KEY: ${NEXT_PUBLIC_SUPABASE_ANON_KEY:-}
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-/api/python}
+        NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-ws://localhost:8000}
+    container_name: skillmate-frontend
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    environment:
+      # Runtime env vars (server-side only — NEXT_PUBLIC_* are baked at build)
+      BACKEND_INTERNAL_URL: http://backend:8000
+      NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:-}
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: ${NEXT_PUBLIC_SUPABASE_ANON_KEY:-}
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - skillmate-network
+
+# ── Volumes ────────────────────────────────────────────────────
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  backend_uploads:
+    driver: local
+  db_backups:
+    driver: local
+
+# ── Networks ───────────────────────────────────────────────────
+networks:
+  skillmate-network:
+    driver: bridge

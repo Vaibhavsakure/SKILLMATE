@@ -1,0 +1,228 @@
+# ============================================================
+# Skillmate AI — Backup Verification Test
+# ============================================================
+# Runs weekly: spins up PostgreSQL, seeds it, runs backup.sh,
+# and verifies the backup file exists and is >1KB.
+# ============================================================
+
+name: Backup Test
+
+on:
+  # Weekly on Sunday at 3:00 AM UTC
+  schedule:
+    - cron: "0 3 * * 0"
+
+  # Allow manual trigger for debugging
+  workflow_dispatch:
+
+jobs:
+  backup-test:
+    name: "Verify pg_dump backup"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    # ── Spin up a PostgreSQL service container ──────────────────
+    services:
+      postgres:
+        image: postgres:16-alpine
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_DB: skillmate
+          POSTGRES_USER: skillmate
+          POSTGRES_PASSWORD: test_password_ci
+        options: >-
+          --health-cmd "pg_isready -U skillmate -d skillmate"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+          --health-start-period 10s
+
+    env:
+      POSTGRES_HOST: localhost
+      POSTGRES_DB: skillmate
+      POSTGRES_USER: skillmate
+      POSTGRES_PASSWORD: test_password_ci
+      POSTGRES_PORT: "5432"
+      BACKUP_DIR: /tmp/backups
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Wait for Postgres to be ready ──────────────────────────
+      - name: Wait for PostgreSQL
+        run: |
+          echo "Waiting for PostgreSQL to accept connections..."
+          for i in $(seq 1 30); do
+            if pg_isready -h localhost -U skillmate -d skillmate; then
+              echo "PostgreSQL is ready."
+              break
+            fi
+            sleep 2
+          done
+
+      # ── Seed the database with sample tables/data ──────────────
+      - name: Seed test database
+        run: |
+          PGPASSWORD="${POSTGRES_PASSWORD}" psql \
+            -h localhost -U skillmate -d skillmate -c "
+              -- Create some representative tables
+              CREATE TABLE IF NOT EXISTS users (
+                id VARCHAR PRIMARY KEY,
+                email VARCHAR UNIQUE NOT NULL,
+                is_pro BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+              );
+
+              CREATE TABLE IF NOT EXISTS analysis_history (
+                id SERIAL PRIMARY KEY,
+                user_id VARCHAR NOT NULL,
+                tool_type VARCHAR NOT NULL,
+                result_data TEXT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+              );
+
+              CREATE TABLE IF NOT EXISTS usage_logs (
+                id VARCHAR PRIMARY KEY,
+                user_id VARCHAR NOT NULL,
+                action VARCHAR NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+              );
+
+              -- Insert sample data
+              INSERT INTO users (id, email, is_pro) VALUES
+                ('u1', 'alice@example.com', true),
+                ('u2', 'bob@example.com', false);
+
+              INSERT INTO analysis_history (user_id, tool_type, result_data) VALUES
+                ('u1', 'resume_rewrite', '{\"rewritten\": \"test content\"}'),
+                ('u2', 'ats_score', '{\"score\": 85}');
+
+              INSERT INTO usage_logs (id, user_id, action) VALUES
+                ('log1', 'u1', 'resume_rewrite'),
+                ('log2', 'u2', 'ats_score');
+          "
+          echo "✅ Database seeded."
+
+      # ── Make backup script executable ──────────────────────────
+      - name: Prepare backup script
+        run: |
+          chmod +x scripts/backup.sh
+          mkdir -p /tmp/backups
+
+      # ── Run backup ─────────────────────────────────────────────
+      - name: Run backup.sh
+        run: |
+          bash scripts/backup.sh
+
+      # ── Verify backup file exists and is valid ─────────────────
+      - name: Verify backup file
+        run: |
+          echo "=== Files in backup directory ==="
+          ls -lh /tmp/backups/
+
+          # Find the backup file
+          BACKUP_FILE=$(ls -1 /tmp/backups/skillmate_*.sql.gz 2>/dev/null | head -1)
+
+          if [ -z "${BACKUP_FILE}" ]; then
+            echo "❌ FAIL: No backup file found!"
+            exit 1
+          fi
+
+          echo "Found backup: ${BACKUP_FILE}"
+
+          # Check file size > 1KB (1024 bytes)
+          FILE_SIZE=$(stat --format=%s "${BACKUP_FILE}")
+          echo "File size: ${FILE_SIZE} bytes"
+
+          if [ "${FILE_SIZE}" -lt 1024 ]; then
+            echo "❌ FAIL: Backup file is too small (${FILE_SIZE} bytes < 1024 bytes)"
+            echo "=== File contents (decompressed) ==="
+            gunzip -c "${BACKUP_FILE}" | head -50
+            exit 1
+          fi
+
+          echo "✅ PASS: Backup file exists and is ${FILE_SIZE} bytes (> 1KB)"
+
+      # ── Verify backup content is valid SQL ─────────────────────
+      - name: Verify backup content
+        run: |
+          BACKUP_FILE=$(ls -1 /tmp/backups/skillmate_*.sql.gz 2>/dev/null | head -1)
+
+          echo "=== Checking for expected SQL statements ==="
+
+          # Decompress and check for CREATE TABLE and INSERT statements
+          CONTENT=$(gunzip -c "${BACKUP_FILE}")
+
+          if echo "${CONTENT}" | grep -q "CREATE TABLE"; then
+            echo "✅ Contains CREATE TABLE statements"
+          else
+            echo "❌ FAIL: No CREATE TABLE statements found"
+            exit 1
+          fi
+
+          if echo "${CONTENT}" | grep -q "users"; then
+            echo "✅ Contains 'users' table data"
+          else
+            echo "⚠️  WARNING: 'users' table not found in dump"
+          fi
+
+          TABLE_COUNT=$(echo "${CONTENT}" | grep -c "CREATE TABLE" || true)
+          echo "Total CREATE TABLE statements: ${TABLE_COUNT}"
+
+          echo ""
+          echo "=== First 20 lines of backup ==="
+          echo "${CONTENT}" | head -20
+
+      # ── Test restore (roundtrip verification) ──────────────────
+      - name: Verify restore works
+        run: |
+          BACKUP_FILE=$(ls -1 /tmp/backups/skillmate_*.sql.gz 2>/dev/null | head -1)
+
+          # Create a separate test database for restore verification
+          PGPASSWORD="${POSTGRES_PASSWORD}" psql \
+            -h localhost -U skillmate -d postgres \
+            -c "CREATE DATABASE skillmate_restore_test OWNER skillmate;"
+
+          # Restore into the test database
+          gunzip -c "${BACKUP_FILE}" | PGPASSWORD="${POSTGRES_PASSWORD}" psql \
+            -h localhost -U skillmate -d skillmate_restore_test \
+            --single-transaction \
+            > /dev/null 2>&1
+
+          # Verify tables exist in restored database
+          TABLE_COUNT=$(PGPASSWORD="${POSTGRES_PASSWORD}" psql \
+            -h localhost -U skillmate -d skillmate_restore_test \
+            -t -c "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public';" \
+            | tr -d ' ')
+
+          echo "Tables in restored database: ${TABLE_COUNT}"
+
+          if [ "${TABLE_COUNT}" -ge 3 ]; then
+            echo "✅ PASS: Restore roundtrip successful (${TABLE_COUNT} tables)"
+          else
+            echo "❌ FAIL: Expected at least 3 tables, got ${TABLE_COUNT}"
+            exit 1
+          fi
+
+          # Verify row counts
+          USER_COUNT=$(PGPASSWORD="${POSTGRES_PASSWORD}" psql \
+            -h localhost -U skillmate -d skillmate_restore_test \
+            -t -c "SELECT count(*) FROM users;" | tr -d ' ')
+
+          echo "Users in restored database: ${USER_COUNT}"
+
+          if [ "${USER_COUNT}" -ge 2 ]; then
+            echo "✅ PASS: Data integrity verified (${USER_COUNT} users)"
+          else
+            echo "❌ FAIL: Expected at least 2 users, got ${USER_COUNT}"
+            exit 1
+          fi
+
+          # Cleanup
+          PGPASSWORD="${POSTGRES_PASSWORD}" psql \
+            -h localhost -U skillmate -d postgres \
+            -c "DROP DATABASE IF EXISTS skillmate_restore_test;"
+
+          echo "✅ All backup verification tests passed."
