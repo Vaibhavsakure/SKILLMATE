@@ -1,0 +1,91 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ================================
+   Skillmate AI — Design System
+   ================================ */
+
+@layer base {
+  :root {
+    --background: 249 250 251;
+    --foreground: 15 23 42;
+    --card: 255 255 255;
+    --card-foreground: 15 23 42;
+    --border: 226 232 240;
+    --input: 226 232 240;
+    --ring: 79 70 229;
+    --muted: 241 245 249;
+    --muted-foreground: 100 116 139;
+    --accent: 79 70 229;
+    --accent-foreground: 255 255 255;
+    --sidebar: 255 255 255;
+    --sidebar-foreground: 15 23 42;
+    --sidebar-border: 241 245 249;
+    --sidebar-hover: 241 245 249;
+  }
+
+  .dark {
+    --background: 15 23 42;
+    --foreground: 226 232 240;
+    --card: 30 41 59;
+    --card-foreground: 226 232 240;
+    --border: 51 65 85;
+    --input: 51 65 85;
+    --ring: 99 102 241;
+    --muted: 30 41 59;
+    --muted-foreground: 148 163 184;
+    --accent: 99 102 241;
+    --accent-foreground: 255 255 255;
+    --sidebar: 15 23 42;
+    --sidebar-foreground: 226 232 240;
+    --sidebar-border: 30 41 59;
+    --sidebar-hover: 30 41 59;
+  }
+
+  /* Smooth transition on theme switch */
+  html {
+    transition: color 0.2s ease, background-color 0.2s ease;
+  }
+}
+
+/* Toast animations */
+@keyframes toast-progress {
+  from { width: 100%; }
+  to { width: 0%; }
+}
+
+.toast-progress-bar {
+  animation: toast-progress 4s linear forwards;
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateX(100%) scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+  }
+}
+
+.animate-toast-in {
+  animation: toast-in 0.3s ease-out forwards;
+}
+
+/* Smooth scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgb(148 163 184 / 0.3);
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgb(148 163 184 / 0.5);
+}
+
