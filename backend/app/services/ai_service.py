@@ -27,7 +27,9 @@ logger = logging.getLogger(__name__)
 
 # --- Initialize Anthropic Claude (Async) ---
 _claude_client = None
-_claude_model = "claude-3-haiku-20240307"  # Fast & cheap, great for JSON
+# Current fast/cheap tier. The previous value, claude-3-haiku-20240307, is a
+# legacy Claude 3 model. Same tier, same intent — just the shipping ID.
+_claude_model = "claude-haiku-4-5"
 
 if settings.anthropic_api_key:
     try:

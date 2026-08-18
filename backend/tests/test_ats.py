@@ -36,6 +36,19 @@ SAMPLE_RESUME_TEXT = (
 )
 
 
+def payload(response):
+    """
+    Return the ATS payload from the SuccessResponse envelope.
+
+    /ats/score declares response_model=SuccessResponse[ATSResponse], so the
+    body is {success, data, message, credits_used, request_id}. These tests
+    originally asserted against the flat shape.
+    """
+    body = response.json()
+    assert body["success"] is True
+    return body["data"]
+
+
 class TestATSScoreHappyPath:
     """Tests for successful ATS score calculations."""
 
@@ -53,7 +66,7 @@ class TestATSScoreHappyPath:
         )
 
         assert response.status_code == 200
-        data = response.json()
+        data = payload(response)
         assert data["score"] == 78
         assert "Kubernetes" in data["missing_keywords"]
         assert len(data["suggestions"]) == 2
@@ -79,7 +92,7 @@ class TestATSScoreHappyPath:
         )
 
         assert response.status_code == 200
-        data = response.json()
+        data = payload(response)
         assert data["score"] == 65
         # Dict keywords should be extracted
         assert data["missing_keywords"] == ["Docker"]
@@ -104,7 +117,7 @@ class TestATSScoreHappyPath:
         )
 
         assert response.status_code == 200
-        assert response.json()["score"] == 0
+        assert payload(response)["score"] == 0
 
 
 class TestATSScoreValidation:

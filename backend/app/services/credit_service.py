@@ -94,6 +94,28 @@ def consume_credits(db: Session, user_id: str, action: str, cost: int) -> tuple:
         return False, 0
 
 
+def spend_credits(db: Session, user_id: str, action: str, cost: int) -> int:
+    """
+    Deduct `cost` credits or raise HTTP 402.
+
+    Wrapper around consume_credits for route handlers: a route that advertises
+    `credits_used=N` in its response must call this, otherwise the balance
+    never moves and the credit system is decorative.
+
+    Returns the remaining balance.
+    """
+    if cost <= 0:
+        return get_user_credits(db, user_id).credits
+
+    ok, remaining = consume_credits(db, user_id, action, cost)
+    if not ok:
+        raise HTTPException(
+            status_code=402,
+            detail=f"Insufficient credits. Required: {cost}, Available: {remaining}",
+        )
+    return remaining
+
+
 def add_credits(db: Session, user_id: str, amount: int, reason: str) -> int:
     """
     Adds credits (for purchases or bonuses).

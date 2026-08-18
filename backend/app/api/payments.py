@@ -6,6 +6,7 @@ import logging
 from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel
 from typing import Optional
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -257,34 +258,80 @@ async def stripe_webhook(request: Request):
         logger.error(f"Webhook signature error: {e}")
         raise HTTPException(status_code=400, detail="Invalid webhook signature")
 
-    # Handle successful payment
-    if event.get("type") == "checkout.session.completed":
-        session = event["data"]["object"]
-        metadata = session.get("metadata", {})
+    event_type = event.get("type")
+    event_id = event.get("id")
 
-        user_id = metadata.get("user_id")
-        pack_id = metadata.get("pack_id")
-        credits_amount = int(metadata.get("credits", 0))
+    # --- Idempotency ---
+    # Stripe retries a webhook until it receives a 2xx, and the dashboard can
+    # replay events by hand. Without this claim, one purchase could credit the
+    # account any number of times.
+    from app.core.database import SessionLocal
+    from app.models.webhook_event import ProcessedWebhookEvent
 
-        if user_id and credits_amount > 0:
-            from app.core.database import SessionLocal
-            db = SessionLocal()
+    db = SessionLocal()
+    try:
+        if not event_id:
+            logger.error("Webhook payload has no event id — refusing to process")
+            raise HTTPException(status_code=400, detail="Webhook event is missing an id")
+
+        already_seen = (
+            db.query(ProcessedWebhookEvent)
+            .filter(ProcessedWebhookEvent.id == event_id)
+            .first()
+        )
+        if already_seen:
+            logger.info(f"Webhook {event_id} ({event_type}) already processed — skipping")
+            return {"status": "duplicate"}
+
+        # Claim the event before running any side effect, so a crash mid-handler
+        # cannot be replayed into a second credit grant.
+        db.add(ProcessedWebhookEvent(
+            id=event_id,
+            provider="stripe",
+            event_type=event_type,
+        ))
+        try:
+            db.commit()
+        except IntegrityError:
+            # A concurrent delivery of the same event won the race.
+            db.rollback()
+            logger.info(f"Webhook {event_id} claimed concurrently — skipping")
+            return {"status": "duplicate"}
+
+        # Handle successful payment
+        if event_type == "checkout.session.completed":
+            session = event["data"]["object"]
+            metadata = session.get("metadata", {}) or {}
+
+            user_id = metadata.get("user_id")
+            pack_id = metadata.get("pack_id")
             try:
+                credits_amount = int(metadata.get("credits", 0))
+            except (TypeError, ValueError):
+                credits_amount = 0
+
+            if user_id and credits_amount > 0:
                 new_balance = add_credits(
                     db=db,
                     user_id=user_id,
                     amount=credits_amount,
                     reason=f"purchase_{pack_id}",
                 )
-                logger.info(f"💰 Credits added: {credits_amount} for user {user_id}. New balance: {new_balance}")
-            finally:
-                db.close()
+                logger.info(
+                    f"💰 Credits added: {credits_amount} for user {user_id}. "
+                    f"New balance: {new_balance}"
+                )
 
-    # Handle recruiter subscription activated
-    if event.get("type") in ("customer.subscription.created", "invoice.payment_succeeded"):
-        session = event["data"]["object"]
-        metadata = session.get("metadata", {})
-        if metadata.get("type") == "recruiter_subscription":
-            logger.info(f"🏢 Recruiter subscription activated for user {metadata.get('user_id')}: {metadata.get('plan_id')}")
+        # Handle recruiter subscription activated
+        elif event_type in ("customer.subscription.created", "invoice.payment_succeeded"):
+            session = event["data"]["object"]
+            metadata = session.get("metadata", {}) or {}
+            if metadata.get("type") == "recruiter_subscription":
+                logger.info(
+                    f"🏢 Recruiter subscription activated for user "
+                    f"{metadata.get('user_id')}: {metadata.get('plan_id')}"
+                )
+    finally:
+        db.close()
 
     return {"status": "received"}

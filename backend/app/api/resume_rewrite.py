@@ -14,9 +14,9 @@ from sqlalchemy.orm import Session
 from app.services.ai_service import ai_service, _claude_client, _claude_model
 from app.services.ats_engine import ats_score_engine
 from app.api.deps import get_current_user
-from app.services.credit_service import check_and_record_quota, record_usage
+from app.services.credit_service import check_and_record_quota, record_usage, spend_credits
 from app.utils.file_parser import extract_text_from_file
-from app.core.database import get_db
+from app.core.database import get_db, SessionLocal
 from app.api.history import save_analysis
 from app.core.docs import document
 from app.core.response_models import SuccessResponse, COMMON_ERRORS, success
@@ -24,6 +24,9 @@ from app.core.response_models import SuccessResponse, COMMON_ERRORS, success
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Credit cost advertised in both rewrite responses — deducted, not just reported.
+REWRITE_COST = 2
 
 
 # --- Response Models ---
@@ -130,6 +133,9 @@ INSTRUCTIONS: {custom_instructions or "Emphasise impact and metrics."}
 JOB: {job_description}
 RESUME: {final_text[:4000]}"""
 
+    # Raises 402 when the wallet can't cover it.
+    spend_credits(db, user.get("id"), "resume_rewrite", REWRITE_COST)
+
     try:
         rewritten = await ai_service.generate_text(prompt)
         await record_usage(user.get('id'), "resume_rewrite", "ai_service", 0, db)
@@ -159,9 +165,11 @@ RESUME: {final_text[:4000]}"""
                 score_comparison=ScoreComparison(**comparison) if comparison else None,
             ),
             message="Resume rewritten successfully",
-            credits_used=2,
+            credits_used=REWRITE_COST,
             request=request,
         )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Resume Rewrite Error for user {user.get('id')}: {e}")
         raise HTTPException(status_code=500, detail="Failed to rewrite resume")
@@ -174,8 +182,9 @@ RESUME: {final_text[:4000]}"""
         **COMMON_ERRORS,
         200: {
             "description": "Token stream of the rewritten resume. "
-                           "The final line is a JSON object prefixed with `__SCORE__:` "
-                           "containing the before/after ATS comparison.",
+                           "The final chunk is an HTML comment of the form "
+                           "`<!--SCORE_DATA:{...}-->` containing the before/after "
+                           "ATS comparison.",
             "content": {"text/plain": {"example": "Results-driven Software Engineer..."}},
         },
     },
@@ -185,9 +194,9 @@ RESUME: {final_text[:4000]}"""
             "Identical to `/rewrite` but streams the rewritten text token-by-token "
             "using `text/plain` chunked transfer encoding for a typewriter UI effect.\\n\\n"
             "**Final chunk format** — after all resume text is streamed, the server "
-            "appends a special terminator line:\\n"
-            "```\\n__SCORE__:{\\\"score_before\\\":54,\\\"score_after\\\":81,...}\\n```\\n"
-            "Clients should split on `__SCORE__:` to separate prose from the score JSON.\\n\\n"
+            "appends a terminator comment:\\n"
+            "```\\n<!--SCORE_DATA:{\\\"score_before\\\":54,\\\"score_after\\\":81,...}-->\\n```\\n"
+            "Clients should split on `<!--SCORE_DATA:` to separate prose from the score JSON.\\n\\n"
             "Costs **2 credits** per call."
         ),
     ),
@@ -215,12 +224,17 @@ async def rewrite_resume_stream(
 
     # Store original text for score comparison after streaming
     original_text = final_text
+    user_id = user.get("id")
 
     prompt = f"""Rewrite the resume to match the job. Be concise. Return plain text only — no intro, no markdown.
 TONE: {tone}
 INSTRUCTIONS: {custom_instructions or "Emphasise impact and metrics."}
 JOB: {job_description}
 RESUME: {final_text[:4000]}"""
+
+    # Charge while we can still return a 402 — once the StreamingResponse
+    # starts, the status line is already on the wire.
+    spend_credits(db, user_id, "resume_rewrite_stream", REWRITE_COST)
 
     if not _claude_client:
         # Fallback: non-streaming with score
@@ -251,15 +265,22 @@ RESUME: {final_text[:4000]}"""
             if comparison:
                 yield "\n<!--SCORE_DATA:" + json.dumps(comparison) + "-->"
 
-            # Save to history after streaming completes
-            save_analysis(
-                db=db,
-                user_id=user.get('id'),
-                tool_type="resume_rewrite",
-                title=f"Resume Rewrite ({tone})",
-                input_summary=job_description[:200],
-                result_data=full_text,
-            )
+            # Save to history after streaming completes.
+            # Uses its own session: the request-scoped `db` from Depends(get_db)
+            # belongs to the endpoint call, and reusing it from inside the
+            # generator ties history writes to dependency-teardown ordering.
+            history_db = SessionLocal()
+            try:
+                save_analysis(
+                    db=history_db,
+                    user_id=user_id,
+                    tool_type="resume_rewrite",
+                    title=f"Resume Rewrite ({tone})",
+                    input_summary=job_description[:200],
+                    result_data=full_text,
+                )
+            finally:
+                history_db.close()
         except Exception as e:
             logger.error(f"Stream error: {e}")
             yield f"\n[Error: {str(e)}]"

@@ -51,10 +51,24 @@ class Settings(BaseSettings):
     # --- Ollama (Local LLM — optional fallback) ---
     ollama_base_url: str = "http://localhost:11434"
 
+    # --- Redis (response cache + ARQ task queue) ---
+    # Docker Compose sets REDIS_URL=redis://redis:6379/0.
+    # Local dev without Docker falls back to localhost.
+    redis_url: str = "redis://localhost:6379/0"
+
     # --- File Upload ---
     max_file_size_mb: int = 10
     upload_dir: str = "uploads"
-    allowed_upload_extensions: List[str] = [".pdf", ".docx", ".doc"]
+    # Extensions accepted by the upload validator. Keep in sync with
+    # app.core.security.FILE_SIGNATURES and app.utils.file_parser.
+    allowed_upload_extensions: List[str] = [".pdf", ".docx", ".doc", ".txt"]
+
+    # --- Admin ---
+    # Comma-separated list of user IDs or emails allowed to read /admin/*.
+    # Empty in production means the admin endpoints are closed to everyone.
+    admin_user_ids: List[str] = []
+    # Protect /metrics with a shared secret sent as the X-Metrics-Token header.
+    metrics_token: Optional[str] = None
 
     # --- Cloud Storage (S3 / Cloudflare R2) ---
     # Leave blank to keep using local uploads/ directory (development default).

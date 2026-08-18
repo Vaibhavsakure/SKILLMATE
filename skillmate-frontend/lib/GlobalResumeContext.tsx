@@ -73,9 +73,18 @@ export function GlobalResumeProvider({ children }: { children: React.ReactNode }
     try {
       setIsLoading(true);
       setError(null);
-      const token = await getToken();
+
+      // getToken() throws when there is no session, so a logged-out visitor
+      // would otherwise land in the catch below and see a "failed to load"
+      // banner on a page that simply has nothing to load.
+      let token: string;
+      try {
+        token = await getToken();
+      } catch {
+        setIsLoading(false);
+        return;
+      }
       if (!token) {
-        // User not logged in — nothing to fetch
         setIsLoading(false);
         return;
       }

@@ -2,10 +2,15 @@
 Job Description Scraper API — Extracts JD text from job posting URLs.
 """
 
+import ipaddress
 import logging
 import re
+import socket
+from urllib.parse import urlparse
+
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 import httpx
 
@@ -14,6 +19,15 @@ from app.api.deps import get_current_user
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# --- SSRF guard configuration ---
+# This endpoint fetches a user-supplied URL and returns the body, so without
+# these checks it is a proxy into anything the backend can reach: cloud
+# metadata (169.254.169.254), other containers on the compose network, and
+# localhost services such as /metrics or the Postgres admin port.
+_ALLOWED_SCHEMES = {"http", "https"}
+_MAX_REDIRECTS = 3
+_MAX_RESPONSE_BYTES = 3 * 1024 * 1024   # 3 MB is plenty for a job posting
 
 
 class ScrapeRequest(BaseModel):
@@ -24,6 +38,80 @@ class ScrapeResponse(BaseModel):
     title: str
     description: str
     source: str
+
+
+async def _assert_public_url(url: str) -> None:
+    """
+    Raise 400 unless `url` is an http(s) URL whose host resolves exclusively to
+    public, routable IP addresses.
+    """
+    parsed = urlparse(url)
+
+    if parsed.scheme.lower() not in _ALLOWED_SCHEMES:
+        raise HTTPException(
+            status_code=400,
+            detail="Only http:// and https:// URLs can be scraped.",
+        )
+
+    host = parsed.hostname
+    if not host:
+        raise HTTPException(status_code=400, detail="URL is missing a hostname.")
+
+    try:
+        # getaddrinfo is blocking — keep it off the event loop.
+        infos = await run_in_threadpool(
+            socket.getaddrinfo, host, parsed.port or (443 if parsed.scheme == "https" else 80),
+            0, socket.SOCK_STREAM,
+        )
+    except socket.gaierror:
+        raise HTTPException(status_code=400, detail="Could not resolve that hostname.")
+
+    if not infos:
+        raise HTTPException(status_code=400, detail="Could not resolve that hostname.")
+
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Could not resolve that hostname.")
+
+        # Rejects loopback, RFC1918, link-local (incl. 169.254.169.254),
+        # unique-local IPv6, multicast, and reserved ranges.
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            logger.warning(f"Blocked SSRF attempt to {host} ({ip})")
+            raise HTTPException(
+                status_code=400,
+                detail="That URL points to a private or internal address.",
+            )
+
+
+async def _fetch_public_url(client: httpx.AsyncClient, url: str, headers: dict) -> httpx.Response:
+    """
+    GET `url`, re-validating the target before every redirect hop.
+
+    httpx's own follow_redirects would only let us check the first URL, so a
+    public host that 302s to 169.254.169.254 would slip straight through.
+    """
+    current = url
+    for _ in range(_MAX_REDIRECTS + 1):
+        await _assert_public_url(current)
+        resp = await client.get(current, headers=headers)
+
+        if resp.is_redirect and resp.headers.get("location"):
+            current = str(resp.next_request.url) if resp.next_request else resp.headers["location"]
+            continue
+
+        return resp
+
+    raise HTTPException(status_code=422, detail="Too many redirects while fetching that URL.")
 
 
 def _clean_html_text(html: str) -> str:
@@ -65,9 +153,17 @@ async def scrape_job_url(
             "Accept-Language": "en-US,en;q=0.9",
         }
 
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-            resp = await client.get(url, headers=headers)
+        # follow_redirects=False: _fetch_public_url walks the chain itself so
+        # every hop is re-checked against the SSRF guard.
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
+            resp = await _fetch_public_url(client, url, headers)
             resp.raise_for_status()
+
+            if len(resp.content) > _MAX_RESPONSE_BYTES:
+                raise HTTPException(
+                    status_code=422,
+                    detail="That page is too large to parse. Paste the job description instead.",
+                )
 
         html = resp.text
 

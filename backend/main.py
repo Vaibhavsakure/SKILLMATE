@@ -4,10 +4,11 @@ Skillmate AI Backend — Main Application
 """
 
 import time
+import secrets
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -96,12 +97,9 @@ async def lifespan(app: FastAPI):
     # Initialize Database Tables
     try:
         from app.core.database import engine, Base
-        from app.models import credit_models  # Register ORM models
-        from app.models import analysis_history  # Register history model
-        from app.models import resume_version  # Register resume version model
-        from app.models import task_queue  # Register task queue model
-        from app.models import user_context as user_context_model  # Register user context model
-        from app.models import recruiter_models  # Register recruiter portal models
+        # Importing app.db.base registers every model on Base.metadata, so
+        # create_all() and Alembic autogenerate see the same set of tables.
+        import app.db.base  # noqa: F401
 
         logger.info("Checking database tables")
         Base.metadata.create_all(bind=engine)
@@ -359,12 +357,26 @@ configure_openapi(app)
 
 # --- Metrics Endpoint ---
 @app.get("/metrics", tags=["Observability"])
-def metrics_endpoint():
+def metrics_endpoint(request: Request):
     """
     Returns live in-process metrics as JSON.
     Consumed by the /admin/health frontend dashboard.
-    Not protected — deploy behind internal network or add IP allowlist.
+
+    In production this requires the METRICS_TOKEN shared secret in the
+    X-Metrics-Token header. Left open in development for convenience.
     """
+    if settings.is_production:
+        expected = settings.metrics_token
+        if not expected:
+            raise HTTPException(
+                status_code=503,
+                detail="Metrics endpoint is disabled: METRICS_TOKEN is not configured.",
+            )
+        provided = request.headers.get("X-Metrics-Token", "")
+        # Constant-time compare so the token can't be recovered byte by byte.
+        if not secrets.compare_digest(provided, expected):
+            raise HTTPException(status_code=403, detail="Invalid metrics token.")
+
     return get_metrics()
 
 

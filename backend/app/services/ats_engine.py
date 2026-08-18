@@ -76,13 +76,27 @@ def ats_score_engine(resume_text: str, jd_text: str) -> Dict:
     total_points = 0
     earned_points = 0
     
-    # Helper to check match with fuzzy logic
+    # Helper to check match with fuzzy logic.
+    #
+    # The fuzzy fallback is O(len(source_tokens)) per keyword, and
+    # all_resume_tokens holds every word plus every 2- and 3-gram of the
+    # resume — tens of thousands of entries for a long CV. Comparing a
+    # single word against a 3-gram can never reach the 90% threshold anyway,
+    # so restrict the scan to candidates of a comparable length. That drops
+    # the work by an order of magnitude without changing any result.
     def check_match(target_word, source_tokens):
         if target_word in source_tokens:
             return True
-        # Fuzzy fallback (slow but handles typos)
+
+        target_len = len(target_word)
+        # ratio >= 90 requires the lengths to be within ~11% of each other.
+        min_len = int(target_len * 0.8)
+        max_len = int(target_len * 1.25) + 1
+
         for src in source_tokens:
-            if fuzz.ratio(target_word, src) >= 90: # Strict 90% match
+            if not (min_len <= len(src) <= max_len):
+                continue
+            if fuzz.ratio(target_word, src) >= 90:  # Strict 90% match
                 return True
         return False
 

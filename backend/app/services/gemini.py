@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 # Initialize Claude client
 _client = None
-_model = "claude-3-haiku-20240307"
+_model = "claude-haiku-4-5"
 
 if settings.anthropic_api_key:
     try:

@@ -9,6 +9,7 @@ from typing import Optional, Dict, Any
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 from supabase import create_client, Client
 
 from app.core.config import settings
@@ -64,8 +65,11 @@ async def get_current_user(
         )
 
     # C. Verify Token with Supabase
+    # supabase-py's auth client is synchronous — calling it directly from an
+    # async dependency blocks the event loop for the whole network round-trip
+    # on every authenticated request. Push it to the threadpool.
     try:
-        user_response = _supabase.auth.get_user(token)
+        user_response = await run_in_threadpool(_supabase.auth.get_user, token)
 
         if not user_response or not user_response.user:
             raise HTTPException(
@@ -134,34 +138,42 @@ def require_credits(cost: int = 1):
     return checker
 
 
-# --- 4. Role Check Dependency ---
+# --- 4. Role Resolution & Check ---
+def resolve_user_role(db: Session, current_user: dict) -> str:
+    """
+    Return the authoritative application role for a user.
+
+    The local `users.role` column is the only trusted source. Supabase's
+    `user.role` is always "authenticated" (a Postgres role, not our role), and
+    `user_metadata` is writable by the client via supabase.auth.updateUser(),
+    so neither can gate access. A user with no local row yet is a plain
+    "student" until they pick a role through POST /api/v1/users/me/role.
+    """
+    from app.models.user import User
+
+    db_user = db.query(User).filter(User.id == current_user.get("id")).first()
+    if db_user and db_user.role:
+        return db_user.role
+    return "student"
+
+
 def require_role(required_role: str):
     """
     Dependency factory — gates an endpoint behind a DB-verified role check.
 
     Uses Depends(get_db) for the same session-sharing reasons as require_credits.
-    Falls back to Supabase user_metadata if the user row doesn't exist in the
-    local DB yet (e.g. first login before the sync job runs).
 
     Usage:
         @router.post("/endpoint")
         async def my_route(user=Depends(require_role("recruiter"))):
             ...
     """
-    from app.models.user import User
 
     async def checker(
         current_user: dict = Depends(get_current_user),
         db: Session = Depends(get_db),          # shared session — no SessionLocal()
     ) -> dict:
-        db_user = db.query(User).filter(User.id == current_user["id"]).first()
-
-        if db_user:
-            user_role = db_user.role
-        else:
-            # Fallback: Supabase user_metadata (before local DB row is created)
-            metadata = current_user.get("user_metadata", {}) or {}
-            user_role = metadata.get("role", "student")
+        user_role = resolve_user_role(db, current_user)
 
         if user_role != required_role:
             raise HTTPException(
@@ -174,3 +186,36 @@ def require_role(required_role: str):
         return current_user
 
     return checker
+
+
+# --- 5. Admin Check Dependency ---
+async def require_admin(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """
+    Gates an endpoint behind superuser access.
+
+    A user qualifies if their local row has is_superuser=True, or if their id
+    or email is listed in the ADMIN_USER_IDS setting. With neither configured
+    the endpoint is closed — admin data is never open by default.
+    """
+    from app.models.user import User
+
+    user_id = current_user.get("id")
+    email = (current_user.get("email") or "").lower()
+
+    allowlist = {str(v).strip().lower() for v in (settings.admin_user_ids or []) if v}
+    if user_id and str(user_id).lower() in allowlist:
+        return current_user
+    if email and email in allowlist:
+        return current_user
+
+    db_user = db.query(User).filter(User.id == user_id).first()
+    if db_user and db_user.is_superuser:
+        return current_user
+
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Administrator access required.",
+    )

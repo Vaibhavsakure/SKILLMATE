@@ -25,6 +25,7 @@ from datetime import datetime
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query, Depends
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app.services.ai_service import ai_service
 from app.core.database import SessionLocal
@@ -85,16 +86,18 @@ class InterviewReport(BaseModel):
 async def verify_ws_token(token: str) -> Optional[Dict[str, Any]]:
     """Verify Supabase JWT token for WebSocket connections."""
     from app.core.config import settings
+    # Reuse the process-wide client built in deps rather than constructing a
+    # fresh one per connection (each create_client opens its own HTTP pool).
+    from app.api.deps import _supabase
 
     if not token:
         return None
 
     # Try Supabase verification
-    if settings.supabase_url and settings.supabase_anon_key:
+    if _supabase:
         try:
-            from supabase import create_client
-            supabase = create_client(settings.supabase_url, settings.supabase_anon_key)
-            user_response = supabase.auth.get_user(token)
+            # supabase-py's auth client is synchronous — off the event loop.
+            user_response = await run_in_threadpool(_supabase.auth.get_user, token)
             if user_response and user_response.user:
                 return {
                     "id": user_response.user.id,
@@ -431,8 +434,8 @@ async def voice_interview_websocket(
                         }
 
                         # Save to history
+                        db = SessionLocal()
                         try:
-                            db = SessionLocal()
                             save_analysis(
                                 db=db,
                                 user_id=user_id,
@@ -442,17 +445,19 @@ async def voice_interview_websocket(
                                 result_data=json.dumps(full_report),
                                 score=full_report["overall_score"],
                             )
-                            db.close()
                         except Exception as e:
                             logger.error(f"Failed to save interview history: {e}")
+                        finally:
+                            db.close()
 
                         # Record usage for quota tracking
+                        usage_db = SessionLocal()
                         try:
-                            usage_db = SessionLocal()
                             await record_usage(user_id, "voice_interview", "ai_service", 0, usage_db)
-                            usage_db.close()
                         except Exception as e:
                             logger.error(f"Failed to record voice interview usage: {e}")
+                        finally:
+                            usage_db.close()
 
                         await websocket.send_json({
                             "type": "interview_complete",

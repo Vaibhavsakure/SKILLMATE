@@ -7,7 +7,7 @@ import logging
 import hashlib
 from fastapi import APIRouter, HTTPException, Depends
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from typing import List, Optional
 from sqlalchemy.orm import Session
 
@@ -60,8 +60,16 @@ async def generate_career_roadmap(
 
     cached = await cache_get(cache_key)
     if cached:
-        logger.info(f"Roadmap cache HIT for user {user_id}, role: {data.target_role}")
-        return RoadmapResponse(**cached)
+        # This used to construct the model unguarded, outside the try below.
+        # Combined with caching before validation (see the write path), one bad
+        # AI response poisoned the key and every request 500'd for 24 hours.
+        try:
+            cached_response = RoadmapResponse(**cached)
+        except ValidationError as exc:
+            logger.warning(f"Discarding malformed roadmap cache entry {cache_key}: {exc}")
+        else:
+            logger.info(f"Roadmap cache HIT for user {user_id}, role: {data.target_role}")
+            return cached_response
 
     skills_context = (
         f"Current Skills/Background: {data.current_skills}"
@@ -81,6 +89,20 @@ CURRENT SKILLS: {skills_context}
         response_data = await ai_service.generate_json(prompt)
         logger.info(f"Career roadmap generated for user {user_id}, role: {data.target_role}")
 
+        # Validate BEFORE caching or saving. generate_json returns {} when every
+        # provider fails, and a partial dict is just as likely; caching either
+        # one persisted a broken payload for the full TTL.
+        try:
+            roadmap = RoadmapResponse(**response_data)
+        except ValidationError as exc:
+            logger.error(f"AI returned an unusable roadmap for user {user_id}: {exc}")
+            raise HTTPException(
+                status_code=502,
+                detail="The AI response could not be parsed. Please try again.",
+            )
+
+        payload = roadmap.model_dump()
+
         # Auto-save to history
         save_analysis(
             db=db,
@@ -88,13 +110,15 @@ CURRENT SKILLS: {skills_context}
             tool_type="career_roadmap",
             title=f"Roadmap: {data.target_role}",
             input_summary=data.current_skills[:200] if data.current_skills else "From scratch",
-            result_data=json.dumps(response_data),
+            result_data=json.dumps(payload),
         )
 
         # --- Store in cache (24 hours) ---
-        await cache_set(cache_key, response_data, ttl=86400)
+        await cache_set(cache_key, payload, ttl=86400)
 
-        return RoadmapResponse(**response_data)
+        return roadmap
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Roadmap Gen Error for user {user_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to generate roadmap")

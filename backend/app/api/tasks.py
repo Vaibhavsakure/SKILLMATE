@@ -20,11 +20,12 @@ from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks
 from pydantic import BaseModel, Field
 from typing import Optional, List
 from sqlalchemy.orm import Session
-from datetime import datetime
+from datetime import datetime, timezone
 
 from arq.connections import ArqRedis, create_pool, RedisSettings
 from arq.jobs import Job, JobStatus
 
+from app.core.config import settings
 from app.core.database import get_db, SessionLocal
 from app.api.deps import get_current_user
 from app.models.task_queue import AsyncTask
@@ -35,8 +36,10 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # --- ARQ Redis pool (lazy singleton) ---
+# Derived from REDIS_URL so the API and the worker agree, and so running
+# outside Docker doesn't try to resolve the compose-only host "redis".
 _arq_pool: Optional[ArqRedis] = None
-_ARQ_REDIS = RedisSettings(host="redis", port=6379, database=0)
+_ARQ_REDIS = RedisSettings.from_dsn(settings.redis_url)
 
 
 async def _get_arq() -> ArqRedis:
@@ -124,7 +127,9 @@ async def process_task(task_id: str, task_type: str, input_data: dict):
 
         task.status = "completed"
         task.result_data = result
-        task.completed_at = datetime.utcnow()
+        # utcnow() is deprecated in Python 3.12 and returns a naive datetime,
+        # which mismatches the timezone-aware DateTime column.
+        task.completed_at = datetime.now(timezone.utc)
         db.commit()
 
         logger.info(f"Task {task_id} completed successfully")

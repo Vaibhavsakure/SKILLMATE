@@ -48,13 +48,21 @@ class VersionListResponse(BaseModel):
 
 
 def _get_or_create_resume(db: Session, user_id: str) -> Resume:
-    """Get or create a base resume container for the user."""
+    """
+    Get or create a base resume container for the user.
+
+    Resume.filename and Resume.extracted_text are NOT NULL, so the placeholder
+    container has to supply both — omitting them raised an IntegrityError and
+    turned every /resume/versions call into a 500 for first-time users.
+    """
     resume = db.query(Resume).filter(Resume.user_id == user_id).first()
     if not resume:
         resume = Resume(
             id=str(uuid.uuid4()),
             user_id=user_id,
             title="My Resume",
+            filename="untitled.txt",
+            extracted_text="",
         )
         db.add(resume)
         db.commit()

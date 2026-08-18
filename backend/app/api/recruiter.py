@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func as sa_func
 
 from app.core.database import get_db
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user, resolve_user_role
 from app.services.ai_service import ai_service
 from app.services.ats_engine import ats_score_engine
 from app.utils.file_parser import extract_text_from_file
@@ -111,12 +111,18 @@ class RecruiterDashboardResponse(BaseModel):
 #  Helpers
 # ===========================================================================
 
-def _require_recruiter(user: dict):
-    """Raises 403 if user is not a recruiter."""
-    role = user.get("role", "")
-    metadata = user.get("user_metadata", {}) or {}
-    meta_role = metadata.get("role", "")
-    if role != "recruiter" and meta_role != "recruiter":
+def _require_recruiter(user: dict, db: Session):
+    """
+    Raises 403 if the user is not a recruiter.
+
+    The role is read from the local `users` table only. The claims on the
+    Supabase user object cannot be used here: `user.role` is always
+    "authenticated", and `user_metadata` is writable by the client via
+    supabase.auth.updateUser(), so trusting it would let any signed-in user
+    grant themselves recruiter access to every job and candidate CV.
+    """
+    role = resolve_user_role(db, user)
+    if role != "recruiter":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Recruiter access required. Your role must be 'recruiter'.",
@@ -199,7 +205,7 @@ async def create_job(
     db: Session = Depends(get_db),
 ):
     """Create a new job opening (recruiter only)."""
-    _require_recruiter(user)
+    _require_recruiter(user, db)
 
     job = RecruiterJob(
         hr_user_id=user["id"],
@@ -239,7 +245,7 @@ async def screen_candidates(
     3. AI-analyzed (ai_service)
     4. Stored as a Candidate row
     """
-    _require_recruiter(user)
+    _require_recruiter(user, db)
 
     # Verify job exists and belongs to this recruiter
     job = db.query(RecruiterJob).filter(
@@ -362,7 +368,7 @@ async def get_shortlist(
     db: Session = Depends(get_db),
 ):
     """Get ranked candidates for a job, sorted by score descending."""
-    _require_recruiter(user)
+    _require_recruiter(user, db)
 
     # Verify ownership
     job = db.query(RecruiterJob).filter(
@@ -399,7 +405,7 @@ async def candidate_action(
     db: Session = Depends(get_db),
 ):
     """Approve or reject a candidate. Triggers email notification."""
-    _require_recruiter(user)
+    _require_recruiter(user, db)
 
     candidate = db.query(Candidate).filter(Candidate.id == data.candidate_id).first()
     if not candidate:
@@ -486,7 +492,7 @@ async def recruiter_dashboard(
     db: Session = Depends(get_db),
 ):
     """Returns recruiter analytics: jobs, candidates, shortlist rate, time saved."""
-    _require_recruiter(user)
+    _require_recruiter(user, db)
 
     jobs = db.query(RecruiterJob).filter(
         RecruiterJob.hr_user_id == user["id"]

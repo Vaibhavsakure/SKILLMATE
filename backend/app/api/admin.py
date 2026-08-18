@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func as sql_func
 
 from app.core.database import get_db
-from app.api.deps import get_current_user
+from app.api.deps import require_admin
 from app.models.analysis_history import AnalysisHistory
 from app.models.credit_models import UserCredits, CreditTransaction
 
@@ -44,11 +44,13 @@ class AdminAnalyticsResponse(BaseModel):
 
 @router.get("/analytics", response_model=AdminAnalyticsResponse)
 async def get_admin_analytics(
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """Returns aggregated analytics for admin dashboard.
-    Note: In production, add is_superuser check.
+    """Returns aggregated analytics for the admin dashboard.
+
+    Requires superuser access — this aggregates every user's activity, so it
+    is gated by require_admin rather than plain authentication.
     """
 
     try:

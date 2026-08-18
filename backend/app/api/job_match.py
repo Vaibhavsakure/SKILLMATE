@@ -6,7 +6,7 @@ import json
 import logging
 import hashlib
 from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from typing import List
 from sqlalchemy.orm import Session
 
@@ -48,8 +48,15 @@ async def match_resume_to_job(
 
     cached = await cache_get(cache_key)
     if cached:
-        logger.info(f"Job match cache HIT for user {user_id}")
-        return JobMatchResponse(**cached)
+        # A malformed entry must not turn into a 500 for the whole TTL —
+        # drop it and recompute.
+        try:
+            cached_response = JobMatchResponse(**cached)
+        except ValidationError as exc:
+            logger.warning(f"Discarding malformed job-match cache entry {cache_key}: {exc}")
+        else:
+            logger.info(f"Job match cache HIT for user {user_id}")
+            return cached_response
 
     prompt = f"""As a technical recruiter, score this resume vs the job. Be concise. Return JSON only (no markdown).
 JOB: {data.job_description[:2000]}

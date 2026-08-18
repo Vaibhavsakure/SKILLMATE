@@ -30,6 +30,19 @@ SAMPLE_RESUME = (
     "Led migration of monolith to microservices architecture."
 )
 
+
+def rewrite_payload(response):
+    """
+    Return the rewrite payload from the SuccessResponse envelope.
+
+    /resume/rewrite declares response_model=SuccessResponse[RewriteResponse],
+    so the body is {success, data, message, credits_used, request_id}. The
+    /versions endpoints below return their models flat, hence no helper there.
+    """
+    body = response.json()
+    assert body["success"] is True
+    return body["data"]
+
 MOCK_REWRITTEN_TEXT = (
     "John Doe — Full-Stack Engineer\n\n"
     "Results-driven engineer with 3+ years architecting scalable web applications "
@@ -72,7 +85,7 @@ class TestResumeRewrite:
         )
 
         assert response.status_code == 200
-        data = response.json()
+        data = rewrite_payload(response)
         assert data["status"] == "success"
         assert "Full-Stack Engineer" in data["rewritten_content"]
         assert data["score_comparison"] is not None
@@ -97,7 +110,7 @@ class TestResumeRewrite:
         )
 
         assert response.status_code == 200
-        data = response.json()
+        data = rewrite_payload(response)
         assert data["status"] == "success"
         # When score_comparison returns None, it should be null in JSON
         assert data["score_comparison"] is None
