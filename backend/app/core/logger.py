@@ -169,7 +169,11 @@ def configure_logging(
         root_logger.addHandler(_make_json_handler(environment, release))
 
     # Silence noisy third-party loggers
-    for noisy in ("httpx", "httpcore", "uvicorn.access", "multipart"):
+    for noisy in (
+        "httpx", "httpcore", "uvicorn.access", "multipart",
+        "hpack", "hpack.hpack", "h2",          # HTTP/2 internals (Supabase SDK)
+        "gotrue", "realtime",                   # Supabase auth/realtime SDK chatter
+    ):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     logging.getLogger("skillmate").info(
