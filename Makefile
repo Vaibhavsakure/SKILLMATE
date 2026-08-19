@@ -50,6 +50,26 @@ prod-pull: ## Pull latest images and restart production
 	$(COMPOSE_PROD) pull
 	$(COMPOSE_PROD) up -d
 
+.PHONY: deploy-prod
+deploy-prod: ## 🚀 One-liner production deploy (build + migrate + up)
+	@echo ""
+	@echo "🚀 Deploying Skillmate AI to production..."
+	@echo ""
+	$(COMPOSE_PROD) build
+	$(COMPOSE_PROD) up -d postgres redis
+	@echo "⏳ Waiting for database to be ready..."
+	@sleep 5
+	$(COMPOSE_PROD) run --rm backend alembic upgrade head
+	$(COMPOSE_PROD) up -d
+	@echo ""
+	@echo "✅ Skillmate AI PRODUCTION deployed!"
+	@echo "   https://yourdomain.com"
+	@echo ""
+
+.PHONY: ssl-setup
+ssl-setup: ## 🔐 Obtain SSL certificates via Let's Encrypt
+	sudo bash scripts/setup_ssl.sh
+
 # ── Database & Migrations ────────────────────────────────────
 
 .PHONY: migrate

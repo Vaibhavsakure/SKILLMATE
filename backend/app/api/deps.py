@@ -114,13 +114,45 @@ def require_credits(cost: int = 1):
         async def my_route(user=Depends(require_credits(cost=2)), db=Depends(get_db)):
             ...
     """
-    from app.services.credit_service import get_user_credits
+    from sqlalchemy.exc import SQLAlchemyError
+    from app.models.credit_models import UserCredits
 
     async def checker(
         current_user: dict = Depends(get_current_user),
         db: Session = Depends(get_db),          # shared session — no SessionLocal()
     ) -> dict:
-        wallet = get_user_credits(db, current_user["id"])
+        user_id = current_user["id"]
+
+        try:
+            # 1. Look up the wallet row
+            wallet = (
+                db.query(UserCredits)
+                .filter(UserCredits.user_id == user_id)
+                .first()
+            )
+
+            # 2. Auto-create with 10 starter credits for brand-new users
+            if wallet is None:
+                logger.info(
+                    "Creating starter credit wallet | user=%s | credits=10", user_id
+                )
+                wallet = UserCredits(user_id=user_id, credits=10)
+                db.add(wallet)
+                db.commit()
+                db.refresh(wallet)
+
+        except SQLAlchemyError as exc:
+            logger.error(
+                "DB error in require_credits | user=%s | type=%s | msg=%s",
+                user_id, type(exc).__name__, exc,
+                exc_info=True,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Service temporarily unavailable. Please try again.",
+            )
+
+        # 3. Enforce balance
         if wallet.credits < cost:
             raise HTTPException(
                 status_code=status.HTTP_402_PAYMENT_REQUIRED,
@@ -129,9 +161,11 @@ def require_credits(cost: int = 1):
                     f"Required: {cost}, Available: {wallet.credits}"
                 ),
             )
+
         return current_user
 
     return checker
+
 
 
 # --- 4. Role Check Dependency ---
@@ -174,3 +208,73 @@ def require_role(required_role: str):
         return current_user
 
     return checker
+
+
+# --- 5. Admin Role Dependency ---
+def require_admin():
+    """
+    Dependency that gates an endpoint behind an admin role check.
+
+    Checks the local DB first (User.role == "admin"), then falls back
+    to Supabase user_metadata. Also rejects banned admins.
+
+    Usage:
+        @router.get("/admin-only")
+        async def my_route(user=Depends(require_admin())):
+            ...
+    """
+    from app.models.user import User
+
+    async def checker(
+        current_user: dict = Depends(get_current_user),
+        db: Session = Depends(get_db),
+    ) -> dict:
+        db_user = db.query(User).filter(User.id == current_user["id"]).first()
+
+        if db_user:
+            user_role = db_user.role
+            is_banned = getattr(db_user, "is_banned", False)
+        else:
+            metadata = current_user.get("user_metadata", {}) or {}
+            user_role = metadata.get("role", "student")
+            is_banned = False
+
+        if is_banned:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Your account has been suspended.",
+            )
+
+        if user_role != "admin":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Admin access required.",
+            )
+        return current_user
+
+    return checker
+
+
+# --- 6. Ban Check (for all authenticated routes) ---
+async def check_ban(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """
+    Lightweight dependency that checks if the authenticated user is banned.
+    Add to any route that should enforce bans.
+
+    Usage:
+        @router.get("/protected")
+        async def my_route(user=Depends(check_ban)):
+            ...
+    """
+    from app.models.user import User
+
+    db_user = db.query(User).filter(User.id == current_user["id"]).first()
+    if db_user and getattr(db_user, "is_banned", False):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your account has been suspended.",
+        )
+    return current_user

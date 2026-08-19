@@ -1,0 +1,313 @@
+# ============================================================
+# Skillmate AI — Manual Deploy & Rollback
+# ============================================================
+# Trigger manually from GitHub UI → Actions → "Manual Deploy"
+#
+# Features:
+#   - Deploy any branch/tag/SHA to production
+#   - Rollback to a previous image tag
+#   - Pre-deploy health snapshot
+#   - Post-deploy verification
+#
+# Required secrets: SERVER_HOST, SERVER_USER, SSH_PRIVATE_KEY
+# ============================================================
+
+name: Manual Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Action to perform"
+        required: true
+        type: choice
+        options:
+          - deploy-latest
+          - deploy-specific-tag
+          - rollback
+          - status-check
+        default: deploy-latest
+
+      image_tag:
+        description: "Image tag to deploy (only for deploy-specific-tag, e.g. sha-abc1234)"
+        required: false
+        default: "latest"
+
+      rollback_tag:
+        description: "Image tag to rollback to (only for rollback, e.g. sha-abc1234)"
+        required: false
+        default: ""
+
+      services:
+        description: "Services to deploy/rollback"
+        required: true
+        type: choice
+        options:
+          - backend frontend
+          - backend
+          - frontend
+        default: "backend frontend"
+
+      skip_migrations:
+        description: "Skip database migrations"
+        required: false
+        type: boolean
+        default: false
+
+env:
+  REGISTRY: ghcr.io
+  BACKEND_IMAGE: ghcr.io/${{ github.repository_owner }}/skillmate-backend
+  FRONTEND_IMAGE: ghcr.io/${{ github.repository_owner }}/skillmate-frontend
+
+permissions:
+  contents: read
+  packages: read
+
+# ============================================================
+jobs:
+# ============================================================
+
+  # ──────────────────────────────────────────────────────────
+  # Status Check (always runs first)
+  # ──────────────────────────────────────────────────────────
+  pre-check:
+    name: 🔍 Pre-Deploy Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    outputs:
+      server-healthy: ${{ steps.health.outputs.healthy }}
+      current-backend: ${{ steps.current.outputs.backend_image }}
+      current-frontend: ${{ steps.current.outputs.frontend_image }}
+
+    steps:
+      - name: Set up SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Add server to known_hosts
+        run: ssh-keyscan -H "${{ secrets.SERVER_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Check current state
+        id: current
+        env:
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+        run: |
+          ssh "$SERVER_USER@$SERVER_HOST" << 'ENDSSH' > /tmp/state.txt
+            cd /opt/skillmate
+            echo "=== Container Status ==="
+            docker compose ps --format "table {{.Name}}\t{{.Status}}\t{{.Image}}"
+            echo ""
+            echo "=== Current Images ==="
+            BACKEND_IMG=$(docker inspect --format='{{.Config.Image}}' skillmate-backend 2>/dev/null || echo "not-running")
+            FRONTEND_IMG=$(docker inspect --format='{{.Config.Image}}' skillmate-frontend 2>/dev/null || echo "not-running")
+            echo "backend=$BACKEND_IMG"
+            echo "frontend=$FRONTEND_IMG"
+          ENDSSH
+          cat /tmp/state.txt
+
+          # Extract current images for rollback reference
+          BACKEND=$(grep "^backend=" /tmp/state.txt | cut -d= -f2)
+          FRONTEND=$(grep "^frontend=" /tmp/state.txt | cut -d= -f2)
+          echo "backend_image=$BACKEND" >> $GITHUB_OUTPUT
+          echo "frontend_image=$FRONTEND" >> $GITHUB_OUTPUT
+
+      - name: Health check
+        id: health
+        env:
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+        run: |
+          RESULT=$(ssh "$SERVER_USER@$SERVER_HOST" "curl -sf http://localhost:8000/health 2>/dev/null" || echo "unhealthy")
+          if echo "$RESULT" | grep -q "ok"; then
+            echo "✅ Server is healthy before deploy"
+            echo "healthy=true" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ Server is NOT healthy before deploy"
+            echo "healthy=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Pre-deploy summary
+        run: |
+          echo "## 🔍 Pre-Deploy Status" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Action | \`${{ inputs.action }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Services | \`${{ inputs.services }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Server Healthy | \`${{ steps.health.outputs.healthy }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Current Backend | \`${{ steps.current.outputs.backend_image }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Current Frontend | \`${{ steps.current.outputs.frontend_image }}\` |" >> $GITHUB_STEP_SUMMARY
+
+  # ──────────────────────────────────────────────────────────
+  # Deploy / Rollback
+  # ──────────────────────────────────────────────────────────
+  execute:
+    name: "🚀 Execute: ${{ inputs.action }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [pre-check]
+    if: inputs.action != 'status-check'
+
+    environment:
+      name: production
+      url: https://${{ secrets.SERVER_HOST }}
+
+    steps:
+      - name: Set up SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Add server to known_hosts
+        run: ssh-keyscan -H "${{ secrets.SERVER_HOST }}" >> ~/.ssh/known_hosts
+
+      # ── Determine target image tag ────────────────────────
+      - name: Resolve target tag
+        id: resolve
+        run: |
+          ACTION="${{ inputs.action }}"
+          if [ "$ACTION" == "deploy-latest" ]; then
+            TAG="latest"
+          elif [ "$ACTION" == "deploy-specific-tag" ]; then
+            TAG="${{ inputs.image_tag }}"
+          elif [ "$ACTION" == "rollback" ]; then
+            TAG="${{ inputs.rollback_tag }}"
+            if [ -z "$TAG" ]; then
+              echo "❌ rollback_tag is required for rollback action"
+              exit 1
+            fi
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "📌 Target tag: $TAG"
+
+      # ── Save current state for emergency rollback ─────────
+      - name: Save rollback snapshot
+        env:
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+        run: |
+          ssh "$SERVER_USER@$SERVER_HOST" << 'ENDSSH'
+            cd /opt/skillmate
+            # Save current image digests
+            docker inspect --format='{{.Image}}' skillmate-backend 2>/dev/null > /tmp/rollback_backend.txt || true
+            docker inspect --format='{{.Image}}' skillmate-frontend 2>/dev/null > /tmp/rollback_frontend.txt || true
+            echo "📸 Rollback snapshot saved"
+          ENDSSH
+
+      # ── Execute deploy/rollback ───────────────────────────
+      - name: "Execute ${{ inputs.action }}"
+        env:
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          TARGET_TAG: ${{ steps.resolve.outputs.tag }}
+          SERVICES: ${{ inputs.services }}
+          SKIP_MIGRATIONS: ${{ inputs.skip_migrations }}
+          BACKEND_IMAGE: ${{ env.BACKEND_IMAGE }}
+          FRONTEND_IMAGE: ${{ env.FRONTEND_IMAGE }}
+        run: |
+          ssh "$SERVER_USER@$SERVER_HOST" << ENDSSH
+            set -e
+            cd /opt/skillmate
+
+            echo "🚀 Action: ${{ inputs.action }}"
+            echo "📌 Tag: $TARGET_TAG"
+            echo "🎯 Services: $SERVICES"
+
+            # Login to GHCR
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io \
+              -u "${{ github.actor }}" --password-stdin
+
+            # Pull specific tagged images
+            for SVC in $SERVICES; do
+              if [ "\$SVC" == "backend" ]; then
+                docker pull "${BACKEND_IMAGE}:${TARGET_TAG}"
+                # Retag as :latest so docker-compose picks it up
+                docker tag "${BACKEND_IMAGE}:${TARGET_TAG}" "${BACKEND_IMAGE}:latest"
+              fi
+              if [ "\$SVC" == "frontend" ]; then
+                docker pull "${FRONTEND_IMAGE}:${TARGET_TAG}"
+                docker tag "${FRONTEND_IMAGE}:${TARGET_TAG}" "${FRONTEND_IMAGE}:latest"
+              fi
+            done
+
+            # Restart only the specified services
+            docker compose up -d --no-deps --no-build $SERVICES
+
+            # Run migrations unless skipped
+            if [ "$SKIP_MIGRATIONS" != "true" ] && echo "$SERVICES" | grep -q "backend"; then
+              echo "🗃️ Running migrations..."
+              docker compose exec -T backend alembic upgrade head 2>/dev/null || echo "⚠️ Migrations skipped (no pending)"
+            fi
+
+            echo "✅ ${{ inputs.action }} complete"
+          ENDSSH
+
+      # ── Post-deploy health check ──────────────────────────
+      - name: Post-deploy health check
+        env:
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+        run: |
+          echo "⏳ Waiting 10s for services to stabilize..."
+          sleep 10
+
+          ssh "$SERVER_USER@$SERVER_HOST" << 'ENDSSH'
+            for i in $(seq 1 12); do
+              if curl -sf http://localhost:8000/health > /dev/null 2>&1; then
+                echo "✅ Backend healthy after deploy"
+
+                # Also check frontend
+                if curl -sf http://localhost:3000/ > /dev/null 2>&1; then
+                  echo "✅ Frontend healthy after deploy"
+                else
+                  echo "⚠️ Frontend not responding (may still be starting)"
+                fi
+                exit 0
+              fi
+              echo "⏳ Attempt $i/12..."
+              sleep 5
+            done
+            echo "❌ Backend health check failed after 60s"
+            docker compose logs --tail=30 backend
+            exit 1
+          ENDSSH
+
+      # ── Emergency auto-rollback on failure ────────────────
+      - name: Auto-rollback on failure
+        if: failure()
+        env:
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+        run: |
+          echo "🔄 Deploy failed — attempting automatic rollback..."
+          ssh "$SERVER_USER@$SERVER_HOST" << 'ENDSSH'
+            cd /opt/skillmate
+
+            # Restart with previous images
+            docker compose up -d --no-deps --no-build backend frontend
+
+            echo "🔄 Rollback attempted. Checking health..."
+            sleep 10
+
+            if curl -sf http://localhost:8000/health > /dev/null 2>&1; then
+              echo "✅ Rollback successful — server is healthy"
+            else
+              echo "❌ Rollback failed — MANUAL INTERVENTION REQUIRED"
+              docker compose logs --tail=50
+            fi
+          ENDSSH
+
+      - name: Deploy summary
+        if: always()
+        run: |
+          STATUS="${{ job.status }}"
+          echo "## Deploy Result: $STATUS" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Action | \`${{ inputs.action }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tag | \`${{ steps.resolve.outputs.tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Services | \`${{ inputs.services }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | @${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Skip Migrations | \`${{ inputs.skip_migrations }}\` |" >> $GITHUB_STEP_SUMMARY

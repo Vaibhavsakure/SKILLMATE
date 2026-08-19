@@ -12,6 +12,7 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.api.deps import get_current_user
 from app.services.credit_service import add_credits
+from app.workers.email_tasks import enqueue_email
 
 logger = logging.getLogger(__name__)
 
@@ -227,43 +228,56 @@ async def create_recruiter_checkout(
 async def stripe_webhook(request: Request):
     """Handles Stripe webhook events (payment completion)."""
 
-    if not _stripe:
-        raise HTTPException(status_code=503, detail="Payment service not configured")
-
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature")
-
     webhook_secret = settings.stripe_webhook_secret
 
+    # ── Secret not configured ─────────────────────────────────────────────────
+    if not webhook_secret:
+        logger.error(
+            "STRIPE_WEBHOOK_SECRET is not set — webhook signature verification "
+            "is DISABLED. Set it immediately in production to prevent spoofed events."
+        )
+        # Return 200 so Stripe stops retrying and spamming logs.
+        # Events are NOT processed without a verified secret.
+        return {"status": "received", "warning": "signature verification disabled"}
+
+    # ── Stripe not initialised ─────────────────────────────────────────────
+    if not _stripe:
+        logger.error("Stripe webhook received but Stripe is not initialised (no STRIPE_SECRET_KEY)")
+        raise HTTPException(status_code=503, detail="Payment service not configured")
+
+    # ── Verify signature ────────────────────────────────────────────────
+    if not sig_header:
+        logger.error("Webhook received without Stripe-Signature header | ip=%s",
+                     request.client.host if request.client else "unknown")
+        raise HTTPException(status_code=400, detail="Missing Stripe-Signature header")
+
     try:
-        if not sig_header:
-            logger.error("Webhook received without Stripe-Signature header")
-            raise HTTPException(status_code=400, detail="Missing Stripe-Signature header")
-
-        if webhook_secret:
-            event = _stripe.Webhook.construct_event(payload, sig_header, webhook_secret)
-        else:
-            # No webhook secret configured — verify we're in development
-            if settings.is_production:
-                logger.error("STRIPE_WEBHOOK_SECRET not configured in production!")
-                raise HTTPException(status_code=500, detail="Webhook verification not configured")
-            import json
-            event = json.loads(payload)
-            logger.warning("⚠️ Webhook signature not verified — set STRIPE_WEBHOOK_SECRET!")
-
-    except HTTPException:
-        raise
+        event = _stripe.Webhook.construct_event(payload, sig_header, webhook_secret)
     except Exception as e:
-        logger.error(f"Webhook signature error: {e}")
+        logger.error(
+            "Webhook signature verification failed | type=%s | msg=%s",
+            type(e).__name__, e,
+            exc_info=True,
+        )
         raise HTTPException(status_code=400, detail="Invalid webhook signature")
 
-    # Handle successful payment
-    if event.get("type") == "checkout.session.completed":
-        session = event["data"]["object"]
+    # ── Log every incoming event type BEFORE processing ──────────────────────
+    event_type = event.get("type", "unknown")
+    event_id   = event.get("id", "unknown")
+    logger.info(
+        "Stripe webhook received | event_type=%s | event_id=%s",
+        event_type, event_id,
+    )
+
+    # ── checkout.session.completed → credit purchase ───────────────────────
+    if event_type == "checkout.session.completed":
+        session  = event["data"]["object"]
         metadata = session.get("metadata", {})
 
-        user_id = metadata.get("user_id")
-        pack_id = metadata.get("pack_id")
+        user_id        = metadata.get("user_id")
+        pack_id        = metadata.get("pack_id")
         credits_amount = int(metadata.get("credits", 0))
 
         if user_id and credits_amount > 0:
@@ -276,15 +290,63 @@ async def stripe_webhook(request: Request):
                     amount=credits_amount,
                     reason=f"purchase_{pack_id}",
                 )
-                logger.info(f"💰 Credits added: {credits_amount} for user {user_id}. New balance: {new_balance}")
+                logger.info(
+                    "Credits added | user=%s | pack=%s | added=%d | new_balance=%d",
+                    user_id, pack_id, credits_amount, new_balance,
+                )
+
+                # ── Trigger 2: payment confirmation email ─────────────
+                try:
+                    # Resolve user email from the Stripe session
+                    customer_email = session.get("customer_details", {}).get("email") or ""
+                    customer_name  = session.get("customer_details", {}).get("name") or customer_email.split("@")[0]
+                    amount_total   = session.get("amount_total", 0) or 0
+                    amount_usd     = f"${amount_total / 100:.2f}"
+
+                    if customer_email:
+                        await enqueue_email(
+                            "credits_purchased",
+                            to_email=customer_email,
+                            name=customer_name,
+                            credits=credits_amount,
+                            amount_usd=amount_usd,
+                        )
+                except Exception as _email_exc:
+                    logger.warning(
+                        "Payment confirmation email failed (non-fatal) | user=%s | error=%s",
+                        user_id, _email_exc,
+                    )
+            except Exception as exc:
+                # Payment succeeded but DB write failed — CRITICAL so it
+                # appears in all alerting channels and can be fixed manually.
+                logger.critical(
+                    "CREDIT GRANT FAILED after successful payment | "
+                    "user_id=%s | pack_id=%s | credits=%d | "
+                    "event_id=%s | type=%s | msg=%s",
+                    user_id, pack_id, credits_amount,
+                    event_id, type(exc).__name__, exc,
+                    exc_info=True,
+                )
             finally:
                 db.close()
+        else:
+            logger.warning(
+                "checkout.session.completed received but metadata incomplete | "
+                "user_id=%s | credits=%s | event_id=%s",
+                user_id, credits_amount, event_id,
+            )
 
-    # Handle recruiter subscription activated
-    if event.get("type") in ("customer.subscription.created", "invoice.payment_succeeded"):
-        session = event["data"]["object"]
+    # ── Recruiter subscription events ─────────────────────────────────
+    elif event_type in ("customer.subscription.created", "invoice.payment_succeeded"):
+        session  = event["data"]["object"]
         metadata = session.get("metadata", {})
         if metadata.get("type") == "recruiter_subscription":
-            logger.info(f"🏢 Recruiter subscription activated for user {metadata.get('user_id')}: {metadata.get('plan_id')}")
+            logger.info(
+                "Recruiter subscription event | user=%s | plan=%s | event_type=%s",
+                metadata.get("user_id"), metadata.get("plan_id"), event_type,
+            )
+
+    else:
+        logger.info("Unhandled Stripe event type: %s (no action taken)", event_type)
 
     return {"status": "received"}

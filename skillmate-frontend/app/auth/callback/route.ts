@@ -5,7 +5,14 @@ import { NextResponse } from "next/server";
 export async function GET(request: Request) {
   const requestUrl = new URL(request.url);
   const code = requestUrl.searchParams.get("code");
-  const origin = requestUrl.origin;
+
+  // Derive the browser-facing origin from the Host header, NOT request.url.
+  // Inside Docker standalone, request.url is http://0.0.0.0:3000 (container HOSTNAME)
+  // but the browser actually sent Host: localhost:3000.
+  const hostHeader = request.headers.get("host") || "localhost:3000";
+  const protocol = request.headers.get("x-forwarded-proto") || "http";
+  const origin = `${protocol}://${hostHeader}`;
+
 
   if (code) {
     const cookieStore = await cookies();

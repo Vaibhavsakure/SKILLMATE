@@ -63,16 +63,26 @@ export async function middleware(request: NextRequest) {
     }
   }
 
-  // B. If Not Logged In -> Block Access to Protected Pages
+  // B. If Not Logged In → Block Access to Protected Pages
   if (!user) {
-    // Protect /dashboard, /rewrite, /recruiter, and /auth/select-role
+    // Protect /dashboard, /rewrite, /recruiter, /admin, and /auth/select-role
     if (
       url.pathname.startsWith("/dashboard") || 
       url.pathname.startsWith("/rewrite") ||
       url.pathname.startsWith("/recruiter") ||
+      url.pathname.startsWith("/admin") ||
       url.pathname.startsWith("/auth/select-role")
     ) {
       url.pathname = "/auth/login";
+      return NextResponse.redirect(url);
+    }
+  }
+
+  // C. Admin Route Protection — only role === "admin" can access /admin/*
+  if (user && url.pathname.startsWith("/admin")) {
+    const role = user.user_metadata?.role;
+    if (role !== "admin") {
+      url.pathname = "/dashboard";
       return NextResponse.redirect(url);
     }
   }
@@ -81,11 +91,11 @@ export async function middleware(request: NextRequest) {
 }
 
 export const config = {
-  // Add '/recruiter/:path*' and '/auth/select-role' here
   matcher: [
     "/dashboard/:path*", 
     "/rewrite/:path*", 
     "/recruiter/:path*",
+    "/admin/:path*",
     "/auth/:path*"
   ],
 };

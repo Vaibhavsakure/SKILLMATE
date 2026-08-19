@@ -85,8 +85,42 @@ def consume_credits(db: Session, user_id: str, action: str, cost: int) -> tuple:
         db.commit()
         db.refresh(wallet)
 
-        logger.info(f"💰 Consumed {cost} credits for {user_id}. Remaining: {wallet.credits}")
-        return True, wallet.credits
+        remaining = wallet.credits
+        logger.info(f"💰 Consumed {cost} credits for {user_id}. Remaining: {remaining}")
+
+        # ── Trigger 3: credit_low warning email ────────────────────────────
+        # Fires when balance drops below 5 after a tool use. Non-blocking.
+        LOW_CREDIT_THRESHOLD = 5
+        if remaining < LOW_CREDIT_THRESHOLD:
+            try:
+                import asyncio
+                from app.workers.email_tasks import enqueue_email
+
+                # Resolve user email and name from DB
+                user_row = db.query(User).filter(User.id == user_id).first()
+                user_email = user_row.email if user_row else ""
+                user_name = user_email.split("@")[0] if user_email else ""
+
+                if user_email:
+                    asyncio.create_task(
+                        enqueue_email(
+                            "credit_low",
+                            to_email=user_email,
+                            name=user_name,
+                            remaining=remaining,
+                        )
+                    )
+            except RuntimeError:
+                # No running event loop (e.g. called from sync context) —
+                # skip silently, never crash the credit transaction.
+                pass
+            except Exception as _email_exc:
+                logger.warning(
+                    "credit_low email trigger failed (non-fatal) | user=%s | error=%s",
+                    user_id, _email_exc,
+                )
+
+        return True, remaining
 
     except SQLAlchemyError as e:
         db.rollback()

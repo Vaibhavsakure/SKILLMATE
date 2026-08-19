@@ -187,6 +187,47 @@ export const generateRoadmap = async (
   ).data as JsonRecord;
 };
 
+// Learning Path (Skill Gap Analysis)
+export type LearningPathRequest = {
+  target_role: string;
+  current_skills?: string;
+  resume_text?: string;
+};
+
+export type LearningPathResource = {
+  name: string;
+  url: string;
+  type: string;
+  platform: string;
+};
+
+export type LearningPathSkillGap = {
+  skill: string;
+  current_level: string;
+  target_level: string;
+  priority: string;
+  resources: LearningPathResource[];
+  estimated_hours: number;
+};
+
+export type LearningPathResponse = {
+  role_summary: string;
+  skill_gaps: LearningPathSkillGap[];
+  total_estimated_weeks: number;
+  recommended_order: string[];
+};
+
+export const generateLearningPath = async (
+  data: LearningPathRequest,
+  token: string,
+): Promise<LearningPathResponse> => {
+  return (
+    await api.post("/learning/analyze-gaps", data, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+  ).data as LearningPathResponse;
+};
+
 // AI Chatbot
 export type ChatMessage = { role: string; content: string };
 
@@ -837,4 +878,38 @@ export const setUserRole = async (
       { headers: { Authorization: `Bearer ${token}` } },
     )
   ).data as SetRoleResponse;
+};
+
+// ========== RESUME ROAST ==========
+
+export type RoastCategoryScore = {
+  name: string;
+  score: number;
+  emoji: string;
+  roast_line: string;
+};
+
+export type RoastResult = {
+  roast_grade: string;
+  roast_emoji: string;
+  overall_score: number;
+  headline: string;
+  roast_lines: string[];
+  category_scores: RoastCategoryScore[];
+  real_talk: string[];
+  ats_score: number;
+  share_text: string;
+};
+
+export const roastResume = async (
+  data: { resume_text?: string; job_description?: string },
+  token: string,
+): Promise<RoastResult> => {
+  const formData = new FormData();
+  if (data.resume_text) formData.append("resume_text", data.resume_text);
+  if (data.job_description) formData.append("job_description", data.job_description);
+  const resp = await api.post("/roast/roast", formData, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return resp.data?.data as RoastResult;
 };

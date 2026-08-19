@@ -26,7 +26,12 @@ class Resume(Base):
     
     # 4. Core Content
     # Stores the text extracted from the *original* uploaded file.
-    extracted_text = Column(Text, nullable=False)
+    extracted_text = Column(Text, nullable=False, server_default="")
+
+    # 5. Storage
+    # Public URL (S3/R2) or local path where the original file lives.
+    # Populated by the upload endpoint; used by migrate_uploads_to_s3.py.
+    file_url = Column(String, nullable=True)       # None = local-only / legacy row
 
     # 5. Timestamps
     created_at = Column(DateTime(timezone=True), server_default=func.now())

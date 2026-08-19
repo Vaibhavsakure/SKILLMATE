@@ -1,0 +1,120 @@
+# ============================================================
+# Skillmate AI — Certbot (Let's Encrypt SSL)
+# ============================================================
+# Usage:
+#
+#   STEP 1 — Initial certificate issuance:
+#     DOMAIN_NAME=skillmate.ai EMAIL=admin@skillmate.ai \
+#     docker compose -f docker-compose.yml \
+#                    -f docker-compose.prod.yml \
+#                    -f docker-compose.certbot.yml \
+#                    run --rm certbot-init
+#
+#   STEP 2 — Start with SSL enabled:
+#     DOMAIN_NAME=skillmate.ai SSL_MODE=on \
+#     docker compose -f docker-compose.yml \
+#                    -f docker-compose.prod.yml \
+#                    -f docker-compose.certbot.yml \
+#                    up -d
+#
+#   The certbot-renew service runs automatically as a sidecar
+#   and renews certs twice daily (at 00:00 and 12:00 UTC).
+#
+# Required env vars (set in .env or shell):
+#   DOMAIN_NAME   — your domain, e.g. skillmate.ai
+#   EMAIL         — your email for Let's Encrypt alerts
+#   SSL_MODE      — set to "on" to enable HTTPS in nginx
+# ============================================================
+
+services:
+
+  # ── Override nginx with SSL-aware config ───────────────────
+  nginx:
+    environment:
+      DOMAIN_NAME: ${DOMAIN_NAME:?DOMAIN_NAME is required}
+      SSL_MODE: ${SSL_MODE:-on}
+    volumes:
+      # Live certificates (read-only for nginx)
+      - letsencrypt:/etc/letsencrypt:ro
+      # ACME webroot challenge directory (shared with certbot)
+      - certbot_webroot:/var/www/certbot:ro
+    depends_on:
+      - frontend
+      - backend
+
+  # ── One-shot: obtain initial certificate ───────────────────
+  # Run with: docker compose ... run --rm certbot-init
+  certbot-init:
+    image: certbot/certbot:latest
+    container_name: skillmate-certbot-init
+    volumes:
+      - letsencrypt:/etc/letsencrypt
+      - certbot_webroot:/var/www/certbot
+    environment:
+      DOMAIN_NAME: ${DOMAIN_NAME:?DOMAIN_NAME is required}
+      EMAIL: ${EMAIL:?EMAIL is required for Let's Encrypt}
+    entrypoint: >
+      sh -c "
+        echo '🔐 Requesting certificate for $${DOMAIN_NAME}...' &&
+        certbot certonly
+          --webroot
+          --webroot-path=/var/www/certbot
+          --email $${EMAIL}
+          --agree-tos
+          --no-eff-email
+          --non-interactive
+          --domains $${DOMAIN_NAME},www.$${DOMAIN_NAME}
+          --rsa-key-size 4096 &&
+        echo '✅ Certificate obtained! Restart nginx with SSL_MODE=on.'
+      "
+    networks:
+      - skillmate-network
+
+  # ── Sidecar: auto-renew certs twice daily ──────────────────
+  # Runs alongside the stack; renews 30 days before expiry.
+  certbot-renew:
+    image: certbot/certbot:latest
+    container_name: skillmate-certbot-renew
+    restart: unless-stopped
+    volumes:
+      - letsencrypt:/etc/letsencrypt
+      - certbot_webroot:/var/www/certbot
+    # Run certbot renew at 00:05 and 12:05 UTC every day.
+    # After renewal, signal nginx to reload without downtime.
+    entrypoint: >
+      sh -c "
+        trap exit TERM;
+        while :; do
+          HOUR=\$$(date -u +%H);
+          MINUTE=\$$(date -u +%M);
+
+          if [ \"\$$HOUR\" = '00' ] && [ \"\$$MINUTE\" = '05' ] ||
+             [ \"\$$HOUR\" = '12' ] && [ \"\$$MINUTE\" = '05' ]; then
+            echo \"[$$(date -u)] 🔄 Running certbot renew...\";
+            certbot renew --quiet --webroot --webroot-path=/var/www/certbot;
+            RENEWED=\$$?;
+            if [ \"\$$RENEWED\" = '0' ]; then
+              echo \"[$$(date -u)] ✅ Renewal check complete\";
+              docker exec skillmate-nginx nginx -s reload 2>/dev/null || true;
+            fi;
+          fi;
+
+          sleep 60 & wait \$$!;
+        done
+      "
+    # Needs access to Docker socket to reload nginx
+    volumes:
+      - letsencrypt:/etc/letsencrypt
+      - certbot_webroot:/var/www/certbot
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - skillmate-network
+    depends_on:
+      - nginx
+
+# ── Volumes ────────────────────────────────────────────────
+volumes:
+  letsencrypt:
+    driver: local
+  certbot_webroot:
+    driver: local

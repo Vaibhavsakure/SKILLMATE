@@ -26,6 +26,8 @@ import {
   Diamond,
   FileCode2,
   Search,
+  Flame,
+  Route,
 } from "lucide-react";
 import { createBrowserClient } from "@supabase/ssr";
 import ChatWidget from "@/components/ChatWidget";
@@ -39,6 +41,7 @@ const navigation = [
   { name: "Resume Builder", href: "/dashboard/resumes", icon: FileText },
   { name: "LaTeX Resume", href: "/dashboard/latex-resume", icon: FileCode2 },
   { name: "Bullet Enhancer", href: "/dashboard/enhance", icon: Diamond },
+  { name: "Resume Roast", href: "/dashboard/resume-roast", icon: Flame },
   { name: "ATS Scanner", href: "/dashboard/ats", icon: ScanSearch },
   { name: "X-Ray ATS", href: "/dashboard/ats/xray", icon: Eye },
   { name: "Job Match", href: "/dashboard/jobs", icon: Briefcase },
@@ -48,6 +51,7 @@ const navigation = [
   { name: "Cover Letter", href: "/dashboard/cover-letter", icon: PenTool },
   { name: "LinkedIn Opt.", href: "/dashboard/linkedin", icon: Share2 },
   { name: "Career Roadmap", href: "/dashboard/roadmap", icon: MapIcon },
+  { name: "Learning Path", href: "/dashboard/learning-path", icon: Route },
   { name: "Skill Tree", href: "/dashboard/skill-tree", icon: Trophy },
   { name: "Skill Projects", href: "/dashboard/projects", icon: FolderGit2 },
   { name: "History", href: "/dashboard/history", icon: History },

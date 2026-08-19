@@ -1,6 +1,9 @@
 import PyPDF2
 import docx
 import io
+import logging
+
+logger = logging.getLogger("skillmate.file_parser")
 
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
 
@@ -25,17 +28,29 @@ def extract_text_from_file(file_content: bytes, filename: str) -> str:
                 reader = PyPDF2.PdfReader(io.BytesIO(file_content))
                 for page in reader.pages:
                     text += page.extract_text() or ""
-            except Exception:
-                raise ValueError("Corrupted or encrypted PDF file.")
-        
+            except Exception as pdf_err:
+                logger.error(
+                    "Corrupted/encrypted PDF | file='%s' | type=%s | msg=%s",
+                    filename, type(pdf_err).__name__, pdf_err,
+                    exc_info=True,
+                )
+                # Return a sentinel so callers can surface a friendly message
+                # without crashing the whole request with a 500.
+                return ""
+
         elif file_extension in ["doc", "docx"]:
             try:
                 doc = docx.Document(io.BytesIO(file_content))
                 for para in doc.paragraphs:
                     text += para.text + "\n"
-            except Exception:
-                 raise ValueError("Corrupted DOCX file.")
-        
+            except Exception as docx_err:
+                logger.error(
+                    "Corrupted DOCX | file='%s' | type=%s | msg=%s",
+                    filename, type(docx_err).__name__, docx_err,
+                    exc_info=True,
+                )
+                return ""
+
         else:
             # Fallback for plain text files
             try:
@@ -46,7 +61,11 @@ def extract_text_from_file(file_content: bytes, filename: str) -> str:
     except ValueError as ve:
         raise ve
     except Exception as e:
-        print(f"Error parsing file {filename}: {e}")
+        logger.error(
+            "Unexpected parse error | file='%s' | type=%s | msg=%s",
+            filename, type(e).__name__, e,
+            exc_info=True,
+        )
         raise ValueError("Failed to process file.")
 
     clean_text = text.strip()
