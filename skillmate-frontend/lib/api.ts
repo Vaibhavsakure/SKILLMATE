@@ -47,16 +47,49 @@ export type ATSResponse = {
 
 type JsonRecord = Record<string, any>;
 
+/**
+ * Standard success envelope returned by endpoints that use
+ * `SuccessResponse[T]` on the backend (currently /ats/score and
+ * /resume/rewrite): { success, data, message, credits_used, request_id }.
+ */
+export type SuccessEnvelope<T> = {
+  success: boolean;
+  data: T;
+  message: string;
+  credits_used: number;
+  request_id: string;
+};
+
+/**
+ * Return the payload whether or not the endpoint wraps it.
+ *
+ * Only some routes use the envelope, so callers were reading `response.score`
+ * off `{success, data: {score}}` and getting undefined. Unwrapping here keeps
+ * every caller on the flat shape regardless of which style the route uses.
+ */
+function unwrap<T>(body: SuccessEnvelope<T> | T): T {
+  if (
+    body &&
+    typeof body === "object" &&
+    "success" in (body as object) &&
+    "data" in (body as object)
+  ) {
+    return (body as SuccessEnvelope<T>).data;
+  }
+  return body as T;
+}
+
 // Resume Rewrite
 export const rewriteResume = async (
   formData: FormData,
   token: string,
 ): Promise<JsonRecord> => {
-  return (
+  const body = (
     await api.post("/resume/rewrite", formData, {
       headers: { Authorization: `Bearer ${token}` },
     })
-  ).data as JsonRecord;
+  ).data;
+  return unwrap<JsonRecord>(body);
 };
 
 // ATS Score
@@ -64,11 +97,12 @@ export const scanATS = async (
   formData: FormData,
   token: string,
 ): Promise<ATSResponse> => {
-  return (
+  const body = (
     await api.post("/ats/score", formData, {
       headers: { Authorization: `Bearer ${token}` },
     })
-  ).data as ATSResponse;
+  ).data;
+  return unwrap<ATSResponse>(body);
 };
 
 // Job Match
@@ -291,13 +325,24 @@ export const exportPDF = async (data: { content: string, title: string, doc_type
 };
 
 // Resume File Parse
-export const parseResumeFile = async (file: File, token: string) => {
+// Uses the dedicated text-extraction route. This previously called
+// /resume/rewrite with a dummy job_description, which spent an AI call and
+// 2 credits just to read the text out of a PDF.
+export type ParseResumeResponse = {
+  text: string;
+  filename: string;
+  char_count: number;
+};
+
+export const parseResumeFile = async (
+  file: File,
+  token: string,
+): Promise<ParseResumeResponse> => {
   const formData = new FormData();
   formData.append("resume_file", file);
-  formData.append("job_description", "parse only");
-  return (await api.post("/resume/rewrite", formData, {
+  return (await api.post("/resume/parse", formData, {
     headers: { "Authorization": `Bearer ${token}` },
-  })).data;
+  })).data as ParseResumeResponse;
 };
 
 // Streaming Rewrite — returns a ReadableStream

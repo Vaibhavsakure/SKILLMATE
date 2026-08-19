@@ -49,7 +49,12 @@ class EnhanceBulletResponse(BaseModel):
 
 
 class EnhanceAllRequest(BaseModel):
-    bullets: List[str] = Field(..., min_items=1, max_items=20, description="List of bullet points")
+    # min_items/max_items are Pydantic v1 names. Under the pinned Pydantic v2
+    # they are not recognised constraints — they were silently dropped into the
+    # JSON schema, so the 20-bullet cap was never enforced on the request.
+    bullets: List[str] = Field(
+        ..., min_length=1, max_length=20, description="List of bullet points"
+    )
     job_context: Optional[str] = None
     tone: str = "professional"
 

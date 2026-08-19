@@ -28,10 +28,13 @@ logger = logging.getLogger("skillmate.worker")
 
 
 # ---------------------------------------------------------------------------
-# Redis settings (matches docker-compose: redis://redis:6379)
+# Redis settings — read from REDIS_URL so the worker and the API enqueue
+# against the same instance (docker-compose sets redis://redis:6379/0).
 # ---------------------------------------------------------------------------
 
-REDIS = RedisSettings(host="redis", port=6379, database=0)
+from app.core.config import settings
+
+REDIS = RedisSettings.from_dsn(settings.redis_url)
 
 
 # ---------------------------------------------------------------------------

@@ -5,7 +5,7 @@ Learning Path API — Skill Gap Analysis with curated learning resources.
 import json
 import logging
 from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from typing import List, Optional
 from sqlalchemy.orm import Session
 
@@ -94,6 +94,17 @@ async def analyze_skill_gaps(
         result = await ai_service.generate_json(prompt)
         logger.info(f"Learning path generated for user {user.get('id')}, role: {data.target_role}")
 
+        # generate_json returns {} when every provider fails, so distinguish
+        # "the AI gave us nothing usable" (502) from a genuine server fault.
+        try:
+            learning_path = LearningPathResponse(**result)
+        except ValidationError as exc:
+            logger.error(f"AI returned an unusable learning path: {exc}")
+            raise HTTPException(
+                status_code=502,
+                detail="The AI response could not be parsed. Please try again.",
+            )
+
         # Save to history
         save_analysis(
             db=db,
@@ -101,11 +112,13 @@ async def analyze_skill_gaps(
             tool_type="learning_path",
             title=f"Skill Gap: {data.target_role}",
             input_summary=data.current_skills[:200] if data.current_skills else "From resume",
-            result_data=json.dumps(result),
+            result_data=json.dumps(learning_path.model_dump()),
         )
 
-        return LearningPathResponse(**result)
+        return learning_path
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Learning path error for user {user.get('id')}: {e}")
         raise HTTPException(status_code=500, detail="Failed to generate learning path")

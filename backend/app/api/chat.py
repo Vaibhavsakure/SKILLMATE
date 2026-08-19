@@ -4,8 +4,8 @@ AI Chatbot API — Conversational career assistant.
 
 import logging
 from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel
-from typing import List
+from pydantic import BaseModel, Field
+from typing import List, Literal
 
 from app.services.ai_service import ai_service
 from app.api.deps import get_current_user
@@ -14,16 +14,24 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+# Caps on replayed history — an unbounded `history` array lets a client push
+# arbitrarily large payloads straight into the model on every request.
+MAX_HISTORY_MESSAGES = 30
+MAX_MESSAGE_CHARS = 8_000
+
 
 # --- Models ---
 class ChatMessage(BaseModel):
-    role: str  # "user" or "assistant"
-    content: str
+    # Literal, not str: a client-supplied role of "system" would be lifted into
+    # the Claude system prompt by ai_service._claude_chat, letting the caller
+    # replace the assistant's instructions.
+    role: Literal["user", "assistant"]
+    content: str = Field(..., max_length=MAX_MESSAGE_CHARS)
 
 
 class ChatRequest(BaseModel):
-    message: str
-    history: List[ChatMessage] = []
+    message: str = Field(..., min_length=1, max_length=MAX_MESSAGE_CHARS)
+    history: List[ChatMessage] = Field(default_factory=list, max_length=MAX_HISTORY_MESSAGES)
 
 
 class ChatResponse(BaseModel):

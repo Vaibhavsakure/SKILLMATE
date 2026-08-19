@@ -1,5 +1,5 @@
-"""
-Skillmate Backend — Authentication & Authorization Dependencies
+﻿"""
+Skillmate Backend ΓÇö Authentication & Authorization Dependencies
 ================================================================
 SINGLE SOURCE OF TRUTH for auth. All routes import from here.
 """
@@ -9,6 +9,7 @@ from typing import Optional, Dict, Any
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 from supabase import create_client, Client
 
 from app.core.config import settings
@@ -22,9 +23,9 @@ _supabase: Optional[Client] = None
 if settings.supabase_url and settings.supabase_anon_key:
     try:
         _supabase = create_client(settings.supabase_url, settings.supabase_anon_key)
-        logger.info("✅ Supabase client initialized")
+        logger.info("Γ£à Supabase client initialized")
     except Exception as e:
-        logger.error(f"❌ Failed to initialize Supabase client: {e}")
+        logger.error(f"Γ¥î Failed to initialize Supabase client: {e}")
 
 # Security Scheme
 security = HTTPBearer(auto_error=False)
@@ -52,7 +53,7 @@ async def get_current_user(
     # B. Check if Supabase is configured
     if not _supabase:
         if settings.env == "development" and settings.allow_dev_mock_auth:
-            logger.warning("⚠️ Dev Mode (Mock Auth) enabled via ALLOW_DEV_MOCK_AUTH")
+            logger.warning("ΓÜá∩╕Å Dev Mode (Mock Auth) enabled via ALLOW_DEV_MOCK_AUTH")
             return {
                 "id": "dev_user_123",
                 "email": "dev@example.com",
@@ -64,8 +65,11 @@ async def get_current_user(
         )
 
     # C. Verify Token with Supabase
+    # supabase-py's auth client is synchronous ΓÇö calling it directly from an
+    # async dependency blocks the event loop for the whole network round-trip
+    # on every authenticated request. Push it to the threadpool.
     try:
-        user_response = _supabase.auth.get_user(token)
+        user_response = await run_in_threadpool(_supabase.auth.get_user, token)
 
         if not user_response or not user_response.user:
             raise HTTPException(
@@ -85,7 +89,7 @@ async def get_current_user(
         raise
     except Exception as e:
         if settings.env == "development" and settings.allow_dev_mock_auth:
-            logger.warning(f"⚠️ Dev Mode fallback auth due to Supabase validation error: {e}")
+            logger.warning(f"ΓÜá∩╕Å Dev Mode fallback auth due to Supabase validation error: {e}")
             return {
                 "id": "dev_user_123",
                 "email": "dev@example.com",
@@ -102,57 +106,25 @@ async def get_current_user(
 # --- 3. Credit Check Dependency ---
 def require_credits(cost: int = 1):
     """
-    Dependency factory — gates an endpoint behind a credit balance check.
+    Dependency factory ΓÇö gates an endpoint behind a credit balance check.
 
     Uses Depends(get_db) so the SAME SQLAlchemy session is shared with the
     calling route. FastAPI deduplicates the dependency: get_db is called once
     per request and the session is closed automatically by the generator when
-    the response is sent — no manual db.close() needed.
+    the response is sent ΓÇö no manual db.close() needed.
 
     Usage:
         @router.post("/endpoint")
         async def my_route(user=Depends(require_credits(cost=2)), db=Depends(get_db)):
             ...
     """
-    from sqlalchemy.exc import SQLAlchemyError
-    from app.models.credit_models import UserCredits
+    from app.services.credit_service import get_user_credits
 
     async def checker(
         current_user: dict = Depends(get_current_user),
-        db: Session = Depends(get_db),          # shared session — no SessionLocal()
+        db: Session = Depends(get_db),          # shared session ΓÇö no SessionLocal()
     ) -> dict:
-        user_id = current_user["id"]
-
-        try:
-            # 1. Look up the wallet row
-            wallet = (
-                db.query(UserCredits)
-                .filter(UserCredits.user_id == user_id)
-                .first()
-            )
-
-            # 2. Auto-create with 10 starter credits for brand-new users
-            if wallet is None:
-                logger.info(
-                    "Creating starter credit wallet | user=%s | credits=10", user_id
-                )
-                wallet = UserCredits(user_id=user_id, credits=10)
-                db.add(wallet)
-                db.commit()
-                db.refresh(wallet)
-
-        except SQLAlchemyError as exc:
-            logger.error(
-                "DB error in require_credits | user=%s | type=%s | msg=%s",
-                user_id, type(exc).__name__, exc,
-                exc_info=True,
-            )
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Service temporarily unavailable. Please try again.",
-            )
-
-        # 3. Enforce balance
+        wallet = get_user_credits(db, current_user["id"])
         if wallet.credits < cost:
             raise HTTPException(
                 status_code=status.HTTP_402_PAYMENT_REQUIRED,
@@ -161,41 +133,47 @@ def require_credits(cost: int = 1):
                     f"Required: {cost}, Available: {wallet.credits}"
                 ),
             )
-
         return current_user
 
     return checker
 
 
+# --- 4. Role Resolution & Check ---
+def resolve_user_role(db: Session, current_user: dict) -> str:
+    """
+    Return the authoritative application role for a user.
 
-# --- 4. Role Check Dependency ---
+    The local `users.role` column is the only trusted source. Supabase's
+    `user.role` is always "authenticated" (a Postgres role, not our role), and
+    `user_metadata` is writable by the client via supabase.auth.updateUser(),
+    so neither can gate access. A user with no local row yet is a plain
+    "student" until they pick a role through POST /api/v1/users/me/role.
+    """
+    from app.models.user import User
+
+    db_user = db.query(User).filter(User.id == current_user.get("id")).first()
+    if db_user and db_user.role:
+        return db_user.role
+    return "student"
+
+
 def require_role(required_role: str):
     """
-    Dependency factory — gates an endpoint behind a DB-verified role check.
+    Dependency factory ΓÇö gates an endpoint behind a DB-verified role check.
 
     Uses Depends(get_db) for the same session-sharing reasons as require_credits.
-    Falls back to Supabase user_metadata if the user row doesn't exist in the
-    local DB yet (e.g. first login before the sync job runs).
 
     Usage:
         @router.post("/endpoint")
         async def my_route(user=Depends(require_role("recruiter"))):
             ...
     """
-    from app.models.user import User
 
     async def checker(
         current_user: dict = Depends(get_current_user),
-        db: Session = Depends(get_db),          # shared session — no SessionLocal()
+        db: Session = Depends(get_db),          # shared session ΓÇö no SessionLocal()
     ) -> dict:
-        db_user = db.query(User).filter(User.id == current_user["id"]).first()
-
-        if db_user:
-            user_role = db_user.role
-        else:
-            # Fallback: Supabase user_metadata (before local DB row is created)
-            metadata = current_user.get("user_metadata", {}) or {}
-            user_role = metadata.get("role", "student")
+        user_role = resolve_user_role(db, current_user)
 
         if user_role != required_role:
             raise HTTPException(
@@ -210,71 +188,34 @@ def require_role(required_role: str):
     return checker
 
 
-# --- 5. Admin Role Dependency ---
-def require_admin():
-    """
-    Dependency that gates an endpoint behind an admin role check.
-
-    Checks the local DB first (User.role == "admin"), then falls back
-    to Supabase user_metadata. Also rejects banned admins.
-
-    Usage:
-        @router.get("/admin-only")
-        async def my_route(user=Depends(require_admin())):
-            ...
-    """
-    from app.models.user import User
-
-    async def checker(
-        current_user: dict = Depends(get_current_user),
-        db: Session = Depends(get_db),
-    ) -> dict:
-        db_user = db.query(User).filter(User.id == current_user["id"]).first()
-
-        if db_user:
-            user_role = db_user.role
-            is_banned = getattr(db_user, "is_banned", False)
-        else:
-            metadata = current_user.get("user_metadata", {}) or {}
-            user_role = metadata.get("role", "student")
-            is_banned = False
-
-        if is_banned:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Your account has been suspended.",
-            )
-
-        if user_role != "admin":
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Admin access required.",
-            )
-        return current_user
-
-    return checker
-
-
-# --- 6. Ban Check (for all authenticated routes) ---
-async def check_ban(
+# --- 5. Admin Check Dependency ---
+async def require_admin(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
     """
-    Lightweight dependency that checks if the authenticated user is banned.
-    Add to any route that should enforce bans.
+    Gates an endpoint behind superuser access.
 
-    Usage:
-        @router.get("/protected")
-        async def my_route(user=Depends(check_ban)):
-            ...
+    A user qualifies if their local row has is_superuser=True, or if their id
+    or email is listed in the ADMIN_USER_IDS setting. With neither configured
+    the endpoint is closed ΓÇö admin data is never open by default.
     """
     from app.models.user import User
 
-    db_user = db.query(User).filter(User.id == current_user["id"]).first()
-    if db_user and getattr(db_user, "is_banned", False):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Your account has been suspended.",
-        )
-    return current_user
+    user_id = current_user.get("id")
+    email = (current_user.get("email") or "").lower()
+
+    allowlist = {str(v).strip().lower() for v in (settings.admin_user_ids or []) if v}
+    if user_id and str(user_id).lower() in allowlist:
+        return current_user
+    if email and email in allowlist:
+        return current_user
+
+    db_user = db.query(User).filter(User.id == user_id).first()
+    if db_user and db_user.is_superuser:
+        return current_user
+
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Administrator access required.",
+    )

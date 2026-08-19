@@ -1,12 +1,21 @@
 """
 Skillmate Backend — Credits Service (Lightweight)
 ===================================================
-Self-contained credit lookup. Used by core/deps.py for require_credits.
+Self-contained credit lookup that opens its own session.
+
+NOTE: routes and dependencies use app.services.credit_service instead, which
+takes an injected Session. These helpers are kept for callers that have no
+request-scoped session (scripts, one-off jobs). Do not mix the two in one
+request — they would run in separate transactions.
 """
+
+import logging
 
 from sqlalchemy.orm import Session
 from app.core.database import SessionLocal
 from app.models.credit_models import UserCredits, CreditTransaction
+
+logger = logging.getLogger(__name__)
 
 
 def get_user_credits(user_id: str) -> int:
@@ -46,5 +55,5 @@ def deduct_credits(user_id: str, amount: int, reason: str = "resume_rewrite") ->
 
         except Exception as e:
             db.rollback()
-            print(f"❌ Error deducting credits: {e}")
+            logger.error(f"❌ Error deducting credits: {e}")
             return False

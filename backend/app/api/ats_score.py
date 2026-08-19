@@ -7,10 +7,11 @@ import logging
 import hashlib
 from fastapi import APIRouter, HTTPException, Request, UploadFile, File, Form, Depends
 from typing import Optional, List
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from sqlalchemy.orm import Session
 
 from app.services.ai_service import ai_service
+from app.services.credit_service import spend_credits
 from app.api.deps import get_current_user
 from app.utils.file_parser import extract_text_from_file
 from app.core.database import get_db
@@ -81,17 +82,29 @@ async def calculate_ats_score(
 
     cached = await cache_get(cache_key)
     if cached:
-        logger.info(f"ATS cache HIT for user {user_id}")
-        return success(
-            ATSResponse(**cached),
-            credits_used=0,
-            request=request,
-        )
+        # A stale or malformed entry must not become a permanent 500 for the
+        # lifetime of the TTL — fall through to a fresh analysis instead.
+        try:
+            cached_response = ATSResponse(**cached)
+        except ValidationError as exc:
+            logger.warning(f"Discarding malformed ATS cache entry {cache_key}: {exc}")
+        else:
+            logger.info(f"ATS cache HIT for user {user_id}")
+            return success(
+                cached_response,
+                credits_used=0,
+                request=request,
+            )
 
     prompt = f"""Score this resume vs the job description. Be concise. Return JSON only (no markdown).
 JOB: {job_description}
 RESUME: {final_text[:4000]}
 {{"score":<int 0-100>,"missing_keywords":["str"],"suggestions":["str"]}}"""
+
+    # Charge before the AI call. A cache hit above returns early with
+    # credits_used=0, so only real analyses cost anything.
+    ATS_SCAN_COST = 1
+    spend_credits(db, user_id, "ats_score", ATS_SCAN_COST)
 
     try:
         ai_data = await ai_service.generate_json(prompt)
@@ -137,7 +150,7 @@ RESUME: {final_text[:4000]}
 
         return success(
             ATSResponse(**response_payload),
-            credits_used=1,
+            credits_used=ATS_SCAN_COST,
             request=request,
         )
 

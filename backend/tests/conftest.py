@@ -15,6 +15,7 @@ from typing import AsyncGenerator, Generator
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.pool import StaticPool
 
 from httpx import ASGITransport, AsyncClient
 
@@ -40,11 +41,19 @@ from main import app
 #  1. Test Database — In-Memory SQLite
 # ============================================================
 
-TEST_DATABASE_URL = "sqlite:///file::memory:?cache=shared"
+# "sqlite:///file::memory:?cache=shared" was passed through to sqlite3 as a
+# literal *filename*, because the shared-cache URI form also needs uri=True in
+# connect_args. Every connection therefore failed with
+# "sqlite3.OperationalError: unable to open database file".
+#
+# A plain in-memory database plus StaticPool is simpler and gives the same
+# property the shared cache was after: every connection sees the same tables.
+TEST_DATABASE_URL = "sqlite://"
 
 test_engine = create_engine(
     TEST_DATABASE_URL,
     connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
 )
 
 TestSessionLocal = sessionmaker(

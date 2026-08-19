@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import { createBrowserClient } from "@supabase/ssr";
+import { getSupabaseBrowserClient } from "@/lib/supabaseClient";
 
 /**
  * Centralized auth hook — uses getUser() for secure server-side validation
@@ -10,12 +10,12 @@ import { createBrowserClient } from "@supabase/ssr";
  * Returns the access_token for API calls and the verified user object.
  */
 
-const supabase = createBrowserClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-);
-
 export function useAuth() {
+  // Resolved per render rather than at module scope: during prerender the
+  // getter hands back a placeholder, and we want the real client once the
+  // component is running in the browser.
+  const supabase = getSupabaseBrowserClient();
+
   const [token, setToken] = useState<string | null>(null);
   const [user, setUser] = useState<any>(null);
   const [loading, setLoading] = useState(true);

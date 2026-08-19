@@ -17,19 +17,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.core.config import settings
 from app.core.database import Base
 
-# --- Import ALL models here so Alembic autogenerate can detect them ---
-from app.models.user import User
-from app.models.user_profile import UserProfile
-from app.models.credit_models import UserCredits, CreditTransaction
-from app.models.analysis_history import AnalysisHistory
-from app.models.resume_version import ResumeVersion
-from app.models.task_queue import AsyncTask
-from app.models.usage import UsageLog
-from app.models.resume import Resume
-from app.models.ats_score import ATSScore
-from app.models.job_description import JobDescription
-from app.models.usage_credit import UsageCredit
-from app.models.recruiter_models import RecruiterJob, Candidate
+# --- Register ALL models so Alembic autogenerate can detect them ---
+# app.db.base is the single place the model list is maintained; importing it
+# here keeps autogenerate in sync with create_all() automatically.
+import app.db.base  # noqa: F401
 
 # Alembic Config object
 config = context.config

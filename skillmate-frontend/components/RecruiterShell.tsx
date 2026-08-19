@@ -14,7 +14,7 @@ import {
   LogOut,
   Building2,
 } from "lucide-react";
-import { createBrowserClient } from "@supabase/ssr";
+import { getSupabaseBrowserClient } from "@/lib/supabaseClient";
 import ThemeToggle from "@/components/ThemeToggle";
 import ToastProvider from "@/components/ToastProvider";
 
@@ -39,10 +39,7 @@ export default function RecruiterShell({
   const router = useRouter();
 
   // Client-side Supabase for Logout
-  const supabase = createBrowserClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-  );
+  const supabase = getSupabaseBrowserClient();
 
   const handleSignOut = async () => {
     await supabase.auth.signOut();

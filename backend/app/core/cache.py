@@ -20,8 +20,10 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import time
 from typing import Any
 
 from app.core.config import settings
@@ -32,37 +34,65 @@ logger = logging.getLogger("skillmate.cache")
 # Redis client singleton
 # ---------------------------------------------------------------------------
 
-_redis = None   # module-level singleton; created lazily on first use
+_redis = None            # module-level singleton; created lazily on first use
+_connect_lock = asyncio.Lock()
+_next_retry_at = 0.0     # epoch seconds; while in the future we skip connecting
+
+# How long to stay in "Redis is down" mode before trying to reconnect. Without
+# this, every request pays the socket_connect_timeout when Redis is unreachable.
+_RETRY_BACKOFF_SECONDS = 30
 
 
 async def _get_client():
     """
-    Return the shared aioredis client, creating it on the first call.
+    Return the shared Redis client, creating it on the first call.
+
     Returns None (with a warning) if Redis is unavailable or not configured.
+    After a failed connection we back off for _RETRY_BACKOFF_SECONDS so a down
+    Redis doesn't add the connect timeout to every single request.
     """
-    global _redis
+    global _redis, _next_retry_at
 
     if _redis is not None:
         return _redis
 
-    redis_url: str = getattr(settings, "redis_url", "redis://redis:6379/0")
+    if time.monotonic() < _next_retry_at:
+        return None
 
-    try:
-        import aioredis  # aioredis >= 2.0
+    async with _connect_lock:
+        # Another coroutine may have connected while we waited for the lock.
+        if _redis is not None:
+            return _redis
+        if time.monotonic() < _next_retry_at:
+            return None
 
-        _redis = await aioredis.from_url(
-            redis_url,
-            encoding="utf-8",
-            decode_responses=True,
-            socket_connect_timeout=2,   # fail fast if Redis is down
-            socket_timeout=2,
-        )
-        # Verify connectivity
-        await _redis.ping()
-        logger.info(f"✅ Redis connected: {redis_url}")
-    except Exception as exc:
-        logger.warning(f"⚠️  Redis unavailable — caching disabled. Reason: {exc}")
-        _redis = None  # keep None so next request retries
+        redis_url: str = settings.redis_url
+
+        try:
+            # redis-py >= 4.2 ships the asyncio client. The old standalone
+            # `aioredis` package is unmaintained and fails to import on
+            # Python 3.11+ (duplicate base class TimeoutError).
+            import redis.asyncio as aioredis
+
+            client = aioredis.from_url(
+                redis_url,
+                encoding="utf-8",
+                decode_responses=True,
+                socket_connect_timeout=2,   # fail fast if Redis is down
+                socket_timeout=2,
+            )
+            # Verify connectivity
+            await client.ping()
+            _redis = client
+            _next_retry_at = 0.0
+            logger.info(f"✅ Redis connected: {redis_url}")
+        except Exception as exc:
+            _next_retry_at = time.monotonic() + _RETRY_BACKOFF_SECONDS
+            logger.warning(
+                f"⚠️  Redis unavailable — caching disabled for "
+                f"{_RETRY_BACKOFF_SECONDS}s. Reason: {exc}"
+            )
+            _redis = None
 
     return _redis
 

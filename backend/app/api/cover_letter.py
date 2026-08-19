@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.services.ai_service import ai_service, _claude_client, _claude_model
 from app.api.deps import get_current_user
-from app.core.database import get_db
+from app.core.database import get_db, SessionLocal
 from app.api.history import save_analysis
 
 logger = logging.getLogger(__name__)
@@ -71,6 +71,8 @@ async def generate_cover_letter_stream(
 ):
     """Streams a cover letter token by token."""
 
+    user_id = user.get("id")
+
     prompt = f"""Write a {data.tone} cover letter. Be concise. Plain text only — no JSON, no markdown.
 · Extract candidate name from resume or use 'Candidate'
 · Hiring Manager: {data.hiring_manager_name}
@@ -96,14 +98,21 @@ RESUME: {data.resume_text[:3000]}"""
                     full_text += text
                     yield text
 
-            save_analysis(
-                db=db,
-                user_id=user.get("id"),
-                tool_type="cover_letter",
-                title=f"Cover Letter ({data.tone})",
-                input_summary=data.job_description[:200],
-                result_data=full_text,
-            )
+            # Own session: the request-scoped `db` belongs to the endpoint
+            # call, not to this generator, which runs while the response body
+            # is being streamed.
+            history_db = SessionLocal()
+            try:
+                save_analysis(
+                    db=history_db,
+                    user_id=user_id,
+                    tool_type="cover_letter",
+                    title=f"Cover Letter ({data.tone})",
+                    input_summary=data.job_description[:200],
+                    result_data=full_text,
+                )
+            finally:
+                history_db.close()
         except Exception as e:
             logger.error(f"Cover letter stream error: {e}")
             yield f"\n[Error: {str(e)}]"

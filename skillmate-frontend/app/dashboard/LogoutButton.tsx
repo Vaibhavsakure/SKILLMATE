@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { createBrowserClient } from "@supabase/ssr";
+import { getSupabaseBrowserClient } from "@/lib/supabaseClient";
 import { LogOut, Loader2 } from "lucide-react";
 
 interface LogoutButtonProps {
@@ -17,10 +17,7 @@ export default function LogoutButton({
   const [isLoading, setIsLoading] = useState(false);
   const router = useRouter();
 
-  const supabase = createBrowserClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-  );
+  const supabase = getSupabaseBrowserClient();
 
   const handleLogout = async () => {
     try {
