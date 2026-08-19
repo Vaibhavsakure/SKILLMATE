@@ -27,10 +27,9 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 # --- Initialize Anthropic Claude (Async) ---
+# --- Initialize Anthropic Claude (Async) ---
 _claude_client = None
-# Current fast/cheap tier. The previous value, claude-3-haiku-20240307, is a
-# legacy Claude 3 model. Same tier, same intent — just the shipping ID.
-_claude_model = "claude-haiku-4-5"
+_claude_model = getattr(settings, "anthropic_model", None) or "claude-3-5-haiku-20241022"
 
 if settings.anthropic_api_key:
     try:
@@ -42,7 +41,15 @@ if settings.anthropic_api_key:
 
 # --- Initialize Groq (Async) ---
 _groq_client = None
-_groq_model = "llama-3.1-8b-instant"
+_groq_model = getattr(settings, "groq_model", None) or "openai/gpt-oss-120b"
+_groq_candidate_models = [
+    _groq_model,
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "groq/compound",
+    "groq/compound-mini",
+    "qwen/qwen3.6-27b",
+]
 
 if settings.groq_api_key:
     try:
@@ -334,6 +341,32 @@ class AIService:
     #  Groq backends (NEW — Fallback 1)
     # ------------------------------------------------------------------ #
 
+    async def _call_groq_with_fallback(self, create_kwargs_fn):
+        """Helper to invoke Groq API with candidate model fallback."""
+        global _groq_model
+        models_to_try = [_groq_model] + [m for m in _groq_candidate_models if m != _groq_model]
+        last_error = None
+
+        for model in models_to_try:
+            try:
+                kwargs = create_kwargs_fn(model)
+                completion = await _groq_client.chat.completions.create(**kwargs)
+                if model != _groq_model:
+                    logger.info(f"Groq switched active model: {_groq_model} → {model}")
+                    _groq_model = model
+                return completion
+            except Exception as e:
+                err_str = str(e).lower()
+                if "model" in err_str and ("not found" in err_str or "decommissioned" in err_str or "404" in err_str or "400" in err_str):
+                    logger.warning(f"Groq model {model} failed ({e}), trying next available model...")
+                    last_error = e
+                    continue
+                raise e
+
+        if last_error:
+            raise last_error
+        raise RuntimeError("No working Groq model found")
+
     async def _groq_json(self, prompt: str) -> Dict[str, Any]:
         """Get structured JSON from Groq."""
         if not settings.groq_api_key:
@@ -343,15 +376,40 @@ class AIService:
             raise RuntimeError("Groq client not initialized")
 
         async def _call():
-            completion = await _groq_client.chat.completions.create(
-                model=_groq_model,
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant. Return ONLY valid JSON. No markdown, no explanation."},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.2,
-                max_tokens=2048,
-            )
+            def make_kwargs(model):
+                kwargs = {
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": "You are a helpful assistant. Return ONLY valid JSON. No markdown, no explanation."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": 0.2,
+                    "max_tokens": 2048,
+                }
+                # Try json_object for supported models
+                if "gpt-oss" in model or "compound" in model:
+                    kwargs["response_format"] = {"type": "json_object"}
+                return kwargs
+
+            try:
+                completion = await self._call_groq_with_fallback(make_kwargs)
+            except Exception as e:
+                # Retry once without response_format if json_object caused issue
+                if "response_format" in str(e).lower():
+                    def make_kwargs_plain(model):
+                        return {
+                            "model": model,
+                            "messages": [
+                                {"role": "system", "content": "You are a helpful assistant. Return ONLY valid JSON. No markdown, no explanation."},
+                                {"role": "user", "content": prompt},
+                            ],
+                            "temperature": 0.2,
+                            "max_tokens": 2048,
+                        }
+                    completion = await self._call_groq_with_fallback(make_kwargs_plain)
+                else:
+                    raise e
+
             raw = completion.choices[0].message.content.strip()
             return self._parse_json_response(raw)
 
@@ -363,12 +421,14 @@ class AIService:
             raise RuntimeError("Groq not configured")
 
         async def _call():
-            completion = await _groq_client.chat.completions.create(
-                model=_groq_model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.7,
-                max_tokens=4096,
-            )
+            def make_kwargs(model):
+                return {
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.7,
+                    "max_tokens": 4096,
+                }
+            completion = await self._call_groq_with_fallback(make_kwargs)
             return completion.choices[0].message.content.strip()
 
         return await _retry_async(_call, max_retries=1, backoff=0.3)
@@ -379,12 +439,14 @@ class AIService:
             raise RuntimeError("Groq not configured")
 
         async def _call():
-            completion = await _groq_client.chat.completions.create(
-                model=_groq_model,
-                messages=messages,
-                temperature=0.7,
-                max_tokens=2048,
-            )
+            def make_kwargs(model):
+                return {
+                    "model": model,
+                    "messages": messages,
+                    "temperature": 0.7,
+                    "max_tokens": 2048,
+                }
+            completion = await self._call_groq_with_fallback(make_kwargs)
             return completion.choices[0].message.content.strip()
 
         return await _retry_async(_call, max_retries=1, backoff=0.3)
