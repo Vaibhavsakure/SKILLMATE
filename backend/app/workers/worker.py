@@ -90,6 +90,30 @@ CURRENT SKILLS: {skills_context}
     except Exception as exc:
         logger.warning(f"[job] history save failed (non-fatal): {exc}")
 
+    # ── Trigger 4: career roadmap ready email ────────────────────
+    try:
+        from app.core.database import SessionLocal
+        from app.models.user import User
+        from app.workers.email_tasks import enqueue_email
+
+        db = SessionLocal()
+        try:
+            user_row = db.query(User).filter(User.id == user_id).first()
+            user_email = user_row.email if user_row else ""
+            user_name  = user_email.split("@")[0] if user_email else ""
+
+            if user_email:
+                await enqueue_email(
+                    "career_roadmap_ready",
+                    to_email=user_email,
+                    name=user_name,
+                )
+                logger.info("[job] roadmap ready email enqueued | user=%s", user_id)
+        finally:
+            db.close()
+    except Exception as exc:
+        logger.warning("[job] roadmap ready email failed (non-fatal): %s", exc)
+
     return result
 
 
@@ -184,13 +208,23 @@ async def send_email_bg(
     from app.services.email_service import email_service
 
     dispatch = {
-        "welcome":           lambda: email_service.send_welcome_email(to_email, kwargs.get("name", "")),
-        "credits_purchased": lambda: email_service.send_credits_purchased(
-            to_email, kwargs.get("name", ""), kwargs.get("credits", 0), kwargs.get("amount", "$0"),
+        "welcome":               lambda: email_service.send_welcome(to_email, kwargs.get("name", "")),
+        "credits_purchased":     lambda: email_service.send_credits_purchased(
+            to_email, kwargs.get("name", ""), kwargs.get("credits", 0), kwargs.get("amount_usd", "$0"),
         ),
-        "password_reset":    lambda: email_service.send_password_reset(to_email, kwargs.get("reset_link", "")),
-        "recruiter_match":   lambda: email_service.send_recruiter_match_alert(
+        "password_reset":        lambda: email_service.send_password_reset(to_email, kwargs.get("reset_link", "")),
+        "recruiter_match":        lambda: email_service.send_recruiter_match(
             to_email, kwargs.get("candidate_name", ""), kwargs.get("job_title", ""), kwargs.get("score", 0),
+        ),
+        # ── New triggers ─────────────────────────────────────────────────────────
+        "credit_low":            lambda: email_service.send_credit_low(
+            to_email, kwargs.get("name", ""), kwargs.get("remaining", 0),
+        ),
+        "career_roadmap_ready":  lambda: email_service.send_career_roadmap_ready(
+            to_email, kwargs.get("name", ""),
+        ),
+        "weekly_digest":         lambda: email_service.send_weekly_digest(
+            to_email, kwargs.get("name", ""), kwargs.get("stats", {}),
         ),
     }
 
@@ -218,6 +252,123 @@ async def shutdown(ctx: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Trigger 5 — Weekly digest cron (every Monday 9:00 AM UTC)
+# ---------------------------------------------------------------------------
+
+async def weekly_digest_bg(ctx: dict) -> dict[str, Any]:
+    """
+    Scheduled cron task: send weekly usage digest to all active users.
+
+    "Active" = at least 1 AI tool use in the past 7 days.
+    Runs every Monday at 09:00 UTC (configured in WorkerSettings.cron_jobs).
+
+    Returns a summary dict: {sent, skipped, failed, total}.
+    """
+    from datetime import datetime, timedelta, timezone
+    from sqlalchemy import func as sa_func
+
+    from app.core.database import SessionLocal
+    from app.models.user import User
+    from app.models.credit_models import UserCredits
+    from app.models.usage import UsageLog
+    from app.models.credit_models import CreditTransaction
+    from app.workers.email_tasks import enqueue_email
+
+    logger.info("[cron] weekly_digest_bg: starting")
+
+    week_ago = datetime.now(timezone.utc) - timedelta(days=7)
+
+    db = SessionLocal()
+    stats_out = {"sent": 0, "skipped": 0, "failed": 0, "total": 0}
+
+    try:
+        # Find users active in the past 7 days
+        active_user_ids = (
+            db.query(UsageLog.user_id)
+            .filter(UsageLog.created_at >= week_ago)
+            .distinct()
+            .all()
+        )
+        active_user_ids = [row[0] for row in active_user_ids]
+        stats_out["total"] = len(active_user_ids)
+
+        logger.info("[cron] weekly_digest: %d active users found", len(active_user_ids))
+
+        for user_id in active_user_ids:
+            try:
+                user_row = db.query(User).filter(User.id == user_id).first()
+                if not user_row or not user_row.email:
+                    stats_out["skipped"] += 1
+                    continue
+
+                # ── Build 7-day stats ──────────────────────────────────
+                # Tools used this week
+                usage_rows = (
+                    db.query(UsageLog.action)
+                    .filter(
+                        UsageLog.user_id == user_id,
+                        UsageLog.created_at >= week_ago,
+                    )
+                    .all()
+                )
+                tools_used = len(usage_rows)
+                tool_counts: dict[str, int] = {}
+                for (action,) in usage_rows:
+                    tool_counts[action] = tool_counts.get(action, 0) + 1
+                top_tool = max(tool_counts, key=tool_counts.get) if tool_counts else "—"
+
+                # Credits spent this week (sum of negative transactions)
+                credits_spent_row = (
+                    db.query(sa_func.sum(CreditTransaction.change))
+                    .filter(
+                        CreditTransaction.user_id == user_id,
+                        CreditTransaction.created_at >= week_ago,
+                        CreditTransaction.change < 0,
+                    )
+                    .scalar()
+                )
+                credits_spent = abs(int(credits_spent_row or 0))
+
+                # Current balance
+                wallet = db.query(UserCredits).filter(UserCredits.user_id == user_id).first()
+                credits_balance = wallet.credits if wallet else 0
+
+                user_stats = {
+                    "tools_used":      tools_used,
+                    "credits_spent":   credits_spent,
+                    "credits_balance": credits_balance,
+                    "top_tool":        top_tool.replace("_", " ").title() if top_tool else "—",
+                    "ats_scores":      [],  # extend later with ATS history if needed
+                }
+
+                user_name = user_row.email.split("@")[0]
+
+                await enqueue_email(
+                    "weekly_digest",
+                    to_email=user_row.email,
+                    name=user_name,
+                    stats=user_stats,
+                )
+                stats_out["sent"] += 1
+
+            except Exception as exc:
+                logger.warning(
+                    "[cron] weekly_digest: failed for user=%s | error=%s",
+                    user_id, exc,
+                )
+                stats_out["failed"] += 1
+
+    finally:
+        db.close()
+
+    logger.info(
+        "[cron] weekly_digest_bg done | sent=%d skipped=%d failed=%d total=%d",
+        stats_out["sent"], stats_out["skipped"], stats_out["failed"], stats_out["total"],
+    )
+    return stats_out
+
+
+# ---------------------------------------------------------------------------
 # WorkerSettings — ARQ picks this up automatically
 # ---------------------------------------------------------------------------
 
@@ -231,6 +382,17 @@ class WorkerSettings:
         generate_career_roadmap_bg,
         bulk_cv_screening_bg,
         send_email_bg,
+        weekly_digest_bg,
+    ]
+    cron_jobs = [
+        # Trigger 5 — weekly digest every Monday at 09:00 UTC
+        cron(
+            weekly_digest_bg,
+            weekday=0,       # 0 = Monday
+            hour=9,
+            minute=0,
+            run_at_startup=False,
+        ),
     ]
     redis_settings = REDIS
     on_startup = startup

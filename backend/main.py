@@ -4,11 +4,10 @@ Skillmate AI Backend — Main Application
 """
 
 import time
-import secrets
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -45,6 +44,8 @@ from app.api import (
     history,
     export,
     resume_parse,
+    resume_upload,
+    resume_roast,
     job_scraper,
     interview_simulator,
     learning_path,
@@ -61,6 +62,7 @@ from app.api import (
     recruiter,
     job_board,
     user_role,
+    ai_test,
 )
 
 logger = get_logger("skillmate.main")
@@ -94,12 +96,49 @@ async def lifespan(app: FastAPI):
         },
     )
 
+    # ── S3 / R2 connectivity check ──────────────────────────────────────────
+    # Tests with a real HeadBucket call. Warns and falls back to local if down.
+    if settings.s3_is_configured:
+        try:
+            from app.services.storage_service import storage_service as _ss
+            s3_ok = await _ss.ping()
+        except Exception:
+            s3_ok = False
+
+        if s3_ok:
+            logger.info(
+                "Storage mode: S3/R2 ✅ | bucket=%s | endpoint=%s",
+                settings.s3_bucket_name,
+                settings.s3_endpoint_url or "AWS default",
+            )
+        else:
+            logger.warning(
+                "Storage mode: S3/R2 configured but UNREACHABLE ⚠️ "
+                "| bucket=%s | endpoint=%s — "
+                "falling back to local /tmp/uploads. "
+                "Check AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and bucket permissions.",
+                settings.s3_bucket_name,
+                settings.s3_endpoint_url or "AWS default",
+            )
+    else:
+        logger.warning(
+            "Storage mode: LOCAL FALLBACK (/tmp/uploads) ⚠️ — "
+            "S3_BUCKET_NAME / credentials not set. "
+            "Uploaded files WILL BE LOST on container restart. "
+            "Set S3_BUCKET_NAME + AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY "
+            "(+ AWS_ENDPOINT_URL for Cloudflare R2) in .env to enable persistent storage."
+        )
+
     # Initialize Database Tables
     try:
         from app.core.database import engine, Base
-        # Importing app.db.base registers every model on Base.metadata, so
-        # create_all() and Alembic autogenerate see the same set of tables.
-        import app.db.base  # noqa: F401
+        from app.models import credit_models  # Register ORM models
+        from app.models import analysis_history  # Register history model
+        from app.models import resume_version  # Register resume version model
+        from app.models import task_queue  # Register task queue model
+        from app.models import user_context as user_context_model  # Register user context model
+        from app.models import recruiter_models  # Register recruiter portal models
+        from app.models import usage  # Register usage_logs table for quota tracking
 
         logger.info("Checking database tables")
         Base.metadata.create_all(bind=engine)
@@ -238,6 +277,20 @@ app.include_router(
     tags=["Resume Parse"],
 )
 
+# 14b. Resume Upload (file storage — S3/local)
+app.include_router(
+    resume_upload.router,
+    prefix="/api/v1/resume",
+    tags=["Resume Upload"],
+)
+
+# 14c. Resume Roast (viral AI roast feature)
+app.include_router(
+    resume_roast.router,
+    prefix="/api/v1/roast",
+    tags=["Resume Roast 🔥"],
+)
+
 # 15. Job Description Scraper
 app.include_router(
     job_scraper.router,
@@ -349,6 +402,13 @@ app.include_router(
     tags=["User Role"],
 )
 
+# 31. AI Provider Diagnostics (admin only)
+app.include_router(
+    ai_test.router,
+    prefix="/api/v1",
+    tags=["AI Diagnostics"],
+)
+
 
 # ── OpenAPI / Swagger documentation ──────────────────────────────────────────
 # Must be called AFTER all routers are registered.
@@ -357,26 +417,12 @@ configure_openapi(app)
 
 # --- Metrics Endpoint ---
 @app.get("/metrics", tags=["Observability"])
-def metrics_endpoint(request: Request):
+def metrics_endpoint():
     """
     Returns live in-process metrics as JSON.
     Consumed by the /admin/health frontend dashboard.
-
-    In production this requires the METRICS_TOKEN shared secret in the
-    X-Metrics-Token header. Left open in development for convenience.
+    Not protected — deploy behind internal network or add IP allowlist.
     """
-    if settings.is_production:
-        expected = settings.metrics_token
-        if not expected:
-            raise HTTPException(
-                status_code=503,
-                detail="Metrics endpoint is disabled: METRICS_TOKEN is not configured.",
-            )
-        provided = request.headers.get("X-Metrics-Token", "")
-        # Constant-time compare so the token can't be recovered byte by byte.
-        if not secrets.compare_digest(provided, expected):
-            raise HTTPException(status_code=403, detail="Invalid metrics token.")
-
     return get_metrics()
 
 
@@ -421,19 +467,30 @@ def health_check():
         health["services"]["database"] = {"status": "error", "detail": str(e)}
         is_healthy = False
 
-    # 2. AI providers availability
+    # 2. Redis connectivity
+    try:
+        import redis
+        redis_url = getattr(settings, "redis_url", "redis://redis:6379/0")
+        r = redis.from_url(redis_url)
+        r.ping()
+        r.close()
+        health["services"]["redis"] = {"status": "connected", "type": "cache / queue"}
+    except Exception as e:
+        health["services"]["redis"] = {"status": "error", "detail": str(e)}
+
+    # 3. AI providers availability
     health["services"]["ai"] = {
         "claude": "configured" if settings.anthropic_api_key else "not_configured",
         "groq": "configured" if settings.groq_api_key else "not_configured",
         "ollama": "configured",
     }
 
-    # 3. Auth service
+    # 4. Auth service
     health["services"]["auth"] = {
         "supabase": "configured" if settings.supabase_url else "not_configured",
     }
 
-    # 4. Payments
+    # 5. Payments
     health["services"]["payments"] = {
         "stripe": "configured" if settings.stripe_secret_key else "not_configured",
     }

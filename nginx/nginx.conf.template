@@ -1,0 +1,51 @@
+# ============================================================
+# Skillmate AI — Nginx Reverse Proxy
+# ============================================================
+# Dual-mode configuration:
+#   LOCAL DEV  → HTTP only (port 80), no SSL required
+#   PRODUCTION → HTTPS (port 443) + HTTP→HTTPS redirect
+#
+# Environment variables (injected via envsubst at startup):
+#   DOMAIN_NAME       — e.g. skillmate.ai (default: localhost)
+#   SSL_MODE          — "on" to enable HTTPS, anything else for HTTP only
+#
+# Proxy targets:
+#   frontend:3000  — Next.js app
+#   backend:8000   — FastAPI API + WebSocket
+# ============================================================
+
+# ── Rate Limiting ────────────────────────────────────────────
+limit_req_zone $binary_remote_addr zone=skillmate_limit:10m rate=1r/s;
+
+# ── Upstream Definitions ─────────────────────────────────────
+upstream frontend {
+    server frontend:3000;
+}
+
+upstream backend {
+    server backend:8000;
+}
+
+# ── HTTP Server ──────────────────────────────────────────────
+# In dev: serves everything directly over HTTP.
+# In prod: handles ACME challenges + redirects to HTTPS.
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${DOMAIN_NAME} www.${DOMAIN_NAME};
+
+    # Let's Encrypt ACME challenge (always active)
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    # ── DEV MODE: proxy everything over HTTP ─────────────────
+    # When SSL_MODE != "on", this block serves the full app.
+    # When SSL_MODE == "on", the include below redirects to HTTPS.
+    include /etc/nginx/conf.d/ssl_redirect.conf;
+}
+
+# ── HTTPS Server (only loaded when certs exist) ──────────────
+# This block is included dynamically via ssl_server.conf.
+# In dev mode, ssl_server.conf is an empty file → nothing loads.
+include /etc/nginx/conf.d/ssl_server.conf;
