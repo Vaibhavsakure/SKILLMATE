@@ -1,5 +1,5 @@
-"""
-Payments API — Stripe integration for credit purchases.
+﻿"""
+Payments API ΓÇö Stripe integration for credit purchases.
 """
 
 import logging
@@ -25,11 +25,11 @@ try:
     if hasattr(settings, 'stripe_secret_key') and settings.stripe_secret_key:
         stripe.api_key = settings.stripe_secret_key
         _stripe = stripe
-        logger.info("✅ Stripe initialized")
+        logger.info("Γ£à Stripe initialized")
     else:
-        logger.info("ℹ️ Stripe not configured (no STRIPE_SECRET_KEY)")
+        logger.info("Γä╣∩╕Å Stripe not configured (no STRIPE_SECRET_KEY)")
 except ImportError:
-    logger.warning("⚠️ stripe package not installed")
+    logger.warning("ΓÜá∩╕Å stripe package not installed")
 
 # Credit Packs
 CREDIT_PACKS = {
@@ -42,14 +42,14 @@ CREDIT_PACKS = {
 RECRUITER_PLANS = {
     "recruiter_starter": {
         "name": "Recruiter Starter",
-        "price_inr_cents": 499900,   # ₹4,999
+        "price_inr_cents": 499900,   # Γé╣4,999
         "max_jobs": 3,
         "max_cvs_month": 200,
         "features": ["3 active job postings", "200 CV screens/month", "AI-powered ranking", "Email notifications"],
     },
     "recruiter_growth": {
         "name": "Recruiter Growth",
-        "price_inr_cents": 999900,   # ₹9,999
+        "price_inr_cents": 999900,   # Γé╣9,999
         "max_jobs": 10,
         "max_cvs_month": 1000,
         "features": ["10 active job postings", "1,000 CV screens/month", "AI-powered ranking", "Email notifications", "Priority support"],
@@ -114,7 +114,7 @@ async def list_recruiter_plans():
         RecruiterPlanInfo(
             id=plan_id,
             name=plan["name"],
-            price=f"₹{plan['price_inr_cents'] / 100:,.0f}/mo",
+            price=f"Γé╣{plan['price_inr_cents'] / 100:,.0f}/mo",
             max_jobs=plan["max_jobs"],
             max_cvs_month=plan["max_cvs_month"],
             features=plan["features"],
@@ -144,7 +144,7 @@ async def create_checkout(
                 "price_data": {
                     "currency": "usd",
                     "product_data": {
-                        "name": f"Skillmate AI — {pack['name']}",
+                        "name": f"Skillmate AI ΓÇö {pack['name']}",
                         "description": f"{pack['credits']} AI credits for resume optimization and career tools",
                     },
                     "unit_amount": pack["price_cents"],
@@ -194,7 +194,7 @@ async def create_recruiter_checkout(
                 "price_data": {
                     "currency": "inr",
                     "product_data": {
-                        "name": f"Skillmate AI — {plan['name']}",
+                        "name": f"Skillmate AI ΓÇö {plan['name']}",
                         "description": f"Up to {plan['max_jobs']} jobs, {plan['max_cvs_month']} CVs/month",
                     },
                     "unit_amount": plan["price_inr_cents"],
@@ -244,13 +244,13 @@ async def stripe_webhook(request: Request):
         if webhook_secret:
             event = _stripe.Webhook.construct_event(payload, sig_header, webhook_secret)
         else:
-            # No webhook secret configured — verify we're in development
+            # No webhook secret configured ΓÇö verify we're in development
             if settings.is_production:
                 logger.error("STRIPE_WEBHOOK_SECRET not configured in production!")
                 raise HTTPException(status_code=500, detail="Webhook verification not configured")
             import json
             event = json.loads(payload)
-            logger.warning("⚠️ Webhook signature not verified — set STRIPE_WEBHOOK_SECRET!")
+            logger.warning("ΓÜá∩╕Å Webhook signature not verified ΓÇö set STRIPE_WEBHOOK_SECRET!")
 
     except HTTPException:
         raise
@@ -271,7 +271,7 @@ async def stripe_webhook(request: Request):
     db = SessionLocal()
     try:
         if not event_id:
-            logger.error("Webhook payload has no event id — refusing to process")
+            logger.error("Webhook payload has no event id ΓÇö refusing to process")
             raise HTTPException(status_code=400, detail="Webhook event is missing an id")
 
         already_seen = (
@@ -280,7 +280,7 @@ async def stripe_webhook(request: Request):
             .first()
         )
         if already_seen:
-            logger.info(f"Webhook {event_id} ({event_type}) already processed — skipping")
+            logger.info(f"Webhook {event_id} ({event_type}) already processed ΓÇö skipping")
             return {"status": "duplicate"}
 
         # Claim the event before running any side effect, so a crash mid-handler
@@ -295,7 +295,7 @@ async def stripe_webhook(request: Request):
         except IntegrityError:
             # A concurrent delivery of the same event won the race.
             db.rollback()
-            logger.info(f"Webhook {event_id} claimed concurrently — skipping")
+            logger.info(f"Webhook {event_id} claimed concurrently ΓÇö skipping")
             return {"status": "duplicate"}
 
         # Handle successful payment
@@ -318,7 +318,7 @@ async def stripe_webhook(request: Request):
                     reason=f"purchase_{pack_id}",
                 )
                 logger.info(
-                    f"💰 Credits added: {credits_amount} for user {user_id}. "
+                    f"≡ƒÆ░ Credits added: {credits_amount} for user {user_id}. "
                     f"New balance: {new_balance}"
                 )
 
@@ -328,7 +328,7 @@ async def stripe_webhook(request: Request):
             metadata = session.get("metadata", {}) or {}
             if metadata.get("type") == "recruiter_subscription":
                 logger.info(
-                    f"🏢 Recruiter subscription activated for user "
+                    f"≡ƒÅó Recruiter subscription activated for user "
                     f"{metadata.get('user_id')}: {metadata.get('plan_id')}"
                 )
     finally:

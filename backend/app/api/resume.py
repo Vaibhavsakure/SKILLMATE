@@ -1,118 +1,197 @@
 import os
-import shutil
+import re
 import uuid
 import io
+import logging
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
 from pydantic import BaseModel
+from typing import Optional
 
-# --- Parsing Libraries (ensure pypdf and python-docx are installed) ---
 import pypdf
 import docx
 
-# Optional: Import auth if you want to protect this route
 from app.api.deps import get_current_user
+from app.core.config import settings
+
+logger = logging.getLogger("skillmate.resume")
 
 router = APIRouter(
     prefix="/resume",
     tags=["Resume Upload & Ingest"],
 )
 
-# --- Configuration ---
-UPLOAD_DIR = "uploads"
-MAX_FILE_SIZE_MB = 10
+# ── Upload directory — always /tmp/uploads inside containers ──────────────────
+UPLOAD_DIR = "/tmp/uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# --- Response Model ---
+# ── File constraints ──────────────────────────────────────────────────────────
+ALLOWED_EXTENSIONS = {".pdf", ".docx", ".doc"}
+MAX_SIZE = settings.max_file_size_mb * 1024 * 1024  # default 10 MB
+
+
+# ── Response model ────────────────────────────────────────────────────────────
 class UploadResponse(BaseModel):
     message: str
-    file_id: str
     filename: str
-    saved_path: str
+    file_url: str
+    text_extracted: str
+    # extra detail fields (backwards-compatible)
+    file_id: str
+    storage: str            # "s3" | "local"
     extracted_text_length: int
-    text_preview: str
 
-# --- Helper Functions (Self-Contained) ---
-def extract_text_from_pdf(path_or_stream) -> str:
-    try:
-        reader = pypdf.PdfReader(path_or_stream)
-        text = ""
-        for page in reader.pages:
-            extracted = page.extract_text()
-            if extracted:
-                text += extracted + "\n"
-        return text.strip()
-    except Exception as e:
-        print(f"Error reading PDF: {e}")
-        return ""
 
-def extract_text_from_docx(path_or_stream) -> str:
-    try:
-        doc = docx.Document(path_or_stream)
-        full_text = [para.text for para in doc.paragraphs]
-        return "\n".join(full_text).strip()
-    except Exception as e:
-        print(f"Error reading DOCX: {e}")
-        return ""
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def _sanitize_filename(name: str) -> str:
+    """Keep only alphanumeric, dots, hyphens; collapse underscores."""
+    name = re.sub(r"[^A-Za-z0-9.\-]", "_", name)
+    name = re.sub(r"_+", "_", name)
+    return name.strip("_") or "upload"
 
-# --- Main Endpoint ---
+
+def extract_text_from_pdf(stream: io.BytesIO) -> str:
+    reader = pypdf.PdfReader(stream)
+    parts = []
+    for page in reader.pages:
+        t = page.extract_text()
+        if t:
+            parts.append(t)
+    return "\n".join(parts).strip()
+
+
+def extract_text_from_docx(stream: io.BytesIO) -> str:
+    doc = docx.Document(stream)
+    return "\n".join(p.text for p in doc.paragraphs).strip()
+
+
+# ── Main endpoint ─────────────────────────────────────────────────────────────
 @router.post("/upload", response_model=UploadResponse)
 async def upload_and_ingest_resume(
     file: UploadFile = File(...),
-    # current_user: dict = Depends(get_current_user) # Uncomment to secure
+    user: dict = Depends(get_current_user),
 ):
     """
-    1. Validates the file (Size/Type).
-    2. Saves it to the 'uploads/' folder securely.
-    3. Extracts text immediately for downstream AI processing.
+    1. Validates file type and size.
+    2. Extracts text (PDF / DOCX / DOC).
+    3. Saves to S3/R2 (or /tmp/uploads/ fallback).
+    4. Returns file_url + first 500 chars of extracted text.
     """
-    
-    # 1. Validation
-    if not file.filename.lower().endswith((".pdf", ".docx")):
-        raise HTTPException(status_code=400, detail="Only PDF or DOCX files allowed")
+    user_id: str = user.get("id", "anonymous")
 
-    # 2. Secure File Saving
-    # Generate a unique ID so files don't overwrite each other
-    file_uuid = str(uuid.uuid4())
+    # ── 1. Extension whitelist ────────────────────────────────────────────────
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No filename provided.")
+
     file_ext = os.path.splitext(file.filename)[1].lower()
-    secure_filename = f"{file_uuid}{file_ext}"
-    file_path = os.path.join(UPLOAD_DIR, secure_filename)
+    if file_ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Only PDF, DOCX, DOC files allowed. Got: '{file_ext or 'none'}'",
+        )
 
+    # ── 2. Pre-read size guard (Content-Length header) ────────────────────────
+    if file.size and file.size > MAX_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large ({file.size / (1024*1024):.1f} MB). Max {settings.max_file_size_mb} MB allowed.",
+        )
+
+    # ── 3. Read bytes ─────────────────────────────────────────────────────────
     try:
-        # We read the file into memory once to process it, then save it.
-        # (For very large files >50MB, you would stream this, but resumes are small)
-        content = await file.read()
-        
-        # Check size
-        if len(content) > MAX_FILE_SIZE_MB * 1024 * 1024:
-            raise HTTPException(status_code=413, detail=f"File too large (> {MAX_FILE_SIZE_MB}MB)")
-
-        # Save to Disk
-        with open(file_path, "wb") as f:
-            f.write(content)
-
-        # 3. Text Extraction
-        # We use io.BytesIO(content) to read from memory without re-opening the file
-        extracted_text = ""
-        file_stream = io.BytesIO(content)
-        
-        if file_ext == ".pdf":
-            extracted_text = extract_text_from_pdf(file_stream)
-        elif file_ext == ".docx":
-            extracted_text = extract_text_from_docx(file_stream)
-
-        # 4. Final Validation
-        if len(extracted_text) < 50:
-             # We warn but don't fail, so the file is still saved
-             print(f"Warning: Extracted text is very short for {secure_filename}")
-
+        contents = await file.read()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"File processing failed: {str(e)}")
+        logger.error(
+            "File read failed | user=%s | file='%s' | type=%s | msg=%s",
+            user_id, file.filename, type(e).__name__, e, exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail="Failed to read uploaded file.")
 
-    return {
-        "message": "Resume uploaded and processed successfully",
-        "file_id": file_uuid,
-        "filename": file.filename,
-        "saved_path": file_path,
-        "extracted_text_length": len(extracted_text),
-        "text_preview": extracted_text[:200] + "..." if extracted_text else "No text extracted"
-    }
+    # Post-read size guard (catches missing Content-Length)
+    if len(contents) > MAX_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large ({len(contents) / (1024*1024):.1f} MB). Max {settings.max_file_size_mb} MB allowed.",
+        )
+
+    # ── 4. Text extraction ────────────────────────────────────────────────────
+    extracted_text = ""
+    try:
+        stream = io.BytesIO(contents)
+        if file_ext == ".pdf":
+            extracted_text = extract_text_from_pdf(stream)
+        elif file_ext in (".docx", ".doc"):
+            extracted_text = extract_text_from_docx(stream)
+    except Exception as e:
+        logger.error(
+            "File parse error | user=%s | file='%s' | type=%s | msg=%s",
+            user_id, file.filename, type(e).__name__, e, exc_info=True,
+        )
+        raise HTTPException(
+            status_code=422,
+            detail="Could not read file. Make sure it's a valid PDF or DOCX.",
+        )
+
+    if len(extracted_text) < 50:
+        logger.warning(
+            "Short extraction (%d chars) | user=%s | file='%s' — may be scanned/image-only.",
+            len(extracted_text), user_id, file.filename,
+        )
+
+    # ── 5. Storage ────────────────────────────────────────────────────────────
+    file_uuid = uuid.uuid4().hex
+    safe_name = f"{file_uuid}_{_sanitize_filename(file.filename)}"
+
+    if settings.s3_bucket_name:
+        # Cloud storage (S3 / Cloudflare R2)
+        try:
+            from app.services.storage_service import storage_service
+            file_url = await storage_service.upload_file(
+                file_bytes=contents,
+                filename=file.filename,
+                user_id=user_id,
+            )
+            storage_mode = "s3"
+            logger.info(
+                "Resume uploaded to S3 | user=%s | file='%s' | url=%s | bytes=%d",
+                user_id, file.filename, file_url, len(contents),
+            )
+        except Exception as exc:
+            logger.error(
+                "S3 upload failed | user=%s | file='%s' | type=%s | msg=%s",
+                user_id, file.filename, type(exc).__name__, exc, exc_info=True,
+            )
+            raise HTTPException(status_code=500, detail="Cloud upload failed. Please try again.")
+    else:
+        # Local fallback — /tmp/uploads/ is writable in every Docker container
+        os.makedirs(UPLOAD_DIR, exist_ok=True)
+        file_path = os.path.join(UPLOAD_DIR, safe_name)
+        try:
+            with open(file_path, "wb") as f:
+                f.write(contents)
+        except Exception as exc:
+            logger.error(
+                "Local write failed | user=%s | path='%s' | type=%s | msg=%s",
+                user_id, file_path, type(exc).__name__, exc, exc_info=True,
+            )
+            raise HTTPException(status_code=500, detail="Could not save file.")
+
+        file_url = f"/uploads/{safe_name}"
+        storage_mode = "local"
+        logger.info(
+            "Resume saved locally | user=%s | file='%s' | path=%s | bytes=%d",
+            user_id, file.filename, file_path, len(contents),
+        )
+
+    # ── 6. Response ───────────────────────────────────────────────────────────
+    return UploadResponse(
+        message="Resume uploaded successfully",
+        filename=file.filename,
+        file_url=file_url,
+        text_extracted=extracted_text[:500] if extracted_text else "",
+        file_id=file_uuid,
+        storage=storage_mode,
+        extracted_text_length=len(extracted_text),
+    )
+
+
+

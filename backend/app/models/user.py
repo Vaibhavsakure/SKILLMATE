@@ -27,9 +27,14 @@ class User(Base):
     is_pro = Column(Boolean, default=False)       # True if they bought a premium pack
     plan_type = Column(String, default="free")    # e.g., "free", "pro_monthly"
 
-    # 4. Timestamps
+    # 5. Admin flags
+    is_banned = Column(Boolean, default=False)    # True = 403 on all requests
+    ban_reason = Column(String, nullable=True)    # Admin-provided reason
+
+    # 6. Timestamps
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
+    last_active = Column(DateTime(timezone=True), nullable=True)  # Updated by middleware
 
     # 5. Relationships
     # Access these easily: user.profile.full_name or user.credits.balance

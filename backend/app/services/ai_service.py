@@ -19,6 +19,7 @@ import threading
 from typing import Dict, Any, List, Optional
 
 import httpx
+from fastapi import HTTPException
 
 from app.core.config import settings
 
@@ -173,16 +174,71 @@ class AIService:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _clean_json_response(content: str) -> str:
-        """Removes markdown fences from JSON strings."""
-        content = content.strip()
-        if content.startswith("```json"):
-            content = content[7:]
-        elif content.startswith("```"):
-            content = content[3:]
-        if content.endswith("```"):
-            content = content[:-3]
-        return content.strip()
+    def _parse_json_response(text: str) -> dict:
+        """
+        Robustly parse a JSON dict from an LLM response that may be wrapped
+        in markdown code fences or contain leading/trailing prose.
+
+        Strategy (in order):
+        1. Strip ```json ... ``` fences.
+        2. Strip plain ``` ... ``` fences.
+        3. Try the raw text as-is.
+        4. Brace-extraction fallback: find first '{' and last '}' and try
+           the substring — handles models that prepend explanation text.
+        5. If all attempts fail, raise ValueError with the raw text so the
+           caller (and circuit breaker) can decide what to do.
+        """
+        import re as _re
+
+        if not text or not text.strip():
+            raise ValueError("AI returned an empty response.")
+
+        candidates: list[str] = []
+
+        # Attempt 1 & 2 — strip markdown fences
+        # Handles ```json\n{...}\n``` and ```\n{...}\n```
+        fence_match = _re.search(
+            r"```(?:json)?\s*([\s\S]*?)```",
+            text,
+            flags=_re.IGNORECASE,
+        )
+        if fence_match:
+            candidates.append(fence_match.group(1).strip())
+
+        # Attempt 3 — raw text (strip leading/trailing whitespace + BOM)
+        candidates.append(text.strip().lstrip("\ufeff"))
+
+        # Attempt 4 — brace extraction (handles prose before/after JSON)
+        brace_start = text.find("{")
+        brace_end = text.rfind("}")
+        if brace_start != -1 and brace_end > brace_start:
+            candidates.append(text[brace_start : brace_end + 1])
+
+        last_err: Exception | None = None
+        for candidate in candidates:
+            if not candidate:
+                continue
+            try:
+                parsed = json.loads(candidate)
+                if isinstance(parsed, dict):
+                    return parsed
+                # Model returned a JSON array or primitive — wrap it
+                return {"result": parsed}
+            except json.JSONDecodeError as exc:
+                last_err = exc
+
+        # All attempts exhausted — log the raw response before raising
+        preview = text[:500].replace("\n", " ")
+        logger.error(
+            "JSON parse failed after all strategies | last_err=%s | raw_response(500)=%r",
+            last_err,
+            preview,
+        )
+        raise ValueError(
+            f"Could not parse JSON from AI response. "
+            f"Last error: {last_err}. "
+            f"Response preview: {preview!r}"
+        )
 
     # ------------------------------------------------------------------ #
     #  Claude backends
@@ -190,8 +246,11 @@ class AIService:
 
     async def _claude_json(self, prompt: str) -> Dict[str, Any]:
         """Get structured JSON from Claude."""
+        if not settings.anthropic_api_key:
+            logger.warning("Claude skipped: no API key (ANTHROPIC_API_KEY is not set)")
+            raise RuntimeError("Claude skipped: no API key")
         if not _claude_client:
-            raise RuntimeError("Claude not configured")
+            raise RuntimeError("Claude client not initialized")
 
         async def _call():
             message = await _claude_client.messages.create(
@@ -203,8 +262,7 @@ class AIService:
                 ],
             )
             raw = message.content[0].text.strip()
-            clean = self._clean_json_response(raw)
-            return json.loads(clean)
+            return self._parse_json_response(raw)
 
         return await _retry_async(_call, max_retries=1, backoff=0.5)
 
@@ -278,8 +336,11 @@ class AIService:
 
     async def _groq_json(self, prompt: str) -> Dict[str, Any]:
         """Get structured JSON from Groq."""
+        if not settings.groq_api_key:
+            logger.warning("Groq skipped: no API key (GROQ_API_KEY is not set)")
+            raise RuntimeError("Groq skipped: no API key")
         if not _groq_client:
-            raise RuntimeError("Groq not configured")
+            raise RuntimeError("Groq client not initialized")
 
         async def _call():
             completion = await _groq_client.chat.completions.create(
@@ -292,8 +353,7 @@ class AIService:
                 max_tokens=2048,
             )
             raw = completion.choices[0].message.content.strip()
-            clean = self._clean_json_response(raw)
-            return json.loads(clean)
+            return self._parse_json_response(raw)
 
         return await _retry_async(_call, max_retries=1, backoff=0.3)
 
@@ -345,9 +405,8 @@ class AIService:
         async with httpx.AsyncClient(timeout=120.0) as client:
             resp = await client.post(_ollama_url, json=payload)
             resp.raise_for_status()
-            content = resp.json().get("response", "{}")
-            clean = self._clean_json_response(content)
-            return json.loads(clean)
+            raw = resp.json().get("response", "")
+            return self._parse_json_response(raw)
 
     async def _ollama_text(self, prompt: str) -> str:
         """Get plain-text from Ollama."""
@@ -380,23 +439,36 @@ class AIService:
     # ------------------------------------------------------------------ #
 
     async def generate_json(self, prompt: str) -> Dict[str, Any]:
-        """Returns a parsed JSON dict from the LLM."""
-        logger.info(f"AI JSON request (first 60 chars): {prompt[:60]}...")
+        """Returns a parsed JSON dict from the LLM.
 
-        # Try Claude first
-        if _claude_client and _cb_claude.can_attempt():
+        Raises:
+            HTTPException(503): if all 3 providers fail or are unavailable.
+        """
+        logger.info("AI JSON request (first 80 chars): %s", prompt[:80])
+        _failures: list[str] = []
+
+        # ── Claude ──────────────────────────────────────────────────────────
+        if not settings.anthropic_api_key:
+            logger.warning("Claude skipped: ANTHROPIC_API_KEY is not set")
+            _failures.append("claude: no API key")
+        elif _cb_claude.can_attempt():
             try:
                 result = await self._claude_json(prompt)
                 _cb_claude.record_success()
                 return result
             except Exception as e:
                 _cb_claude.record_failure()
-                logger.warning(f"Claude JSON failed: {e}")
-        elif _claude_client:
+                _failures.append(f"claude: {type(e).__name__}: {e}")
+                logger.warning("Claude JSON failed | type=%s | msg=%s", type(e).__name__, e)
+        else:
+            _failures.append("claude: circuit breaker OPEN")
             logger.info("CircuitBreaker[claude]: OPEN — skipping Claude for JSON")
 
-        # Fallback 1: Groq
-        if _groq_client and _cb_groq.can_attempt():
+        # ── Groq ─────────────────────────────────────────────────────────────
+        if not settings.groq_api_key:
+            logger.warning("Groq skipped: GROQ_API_KEY is not set")
+            _failures.append("groq: no API key")
+        elif _cb_groq.can_attempt():
             try:
                 logger.info("Falling back to Groq for JSON...")
                 result = await self._groq_json(prompt)
@@ -404,11 +476,13 @@ class AIService:
                 return result
             except Exception as e:
                 _cb_groq.record_failure()
-                logger.warning(f"Groq JSON failed: {e}")
-        elif _groq_client:
+                _failures.append(f"groq: {type(e).__name__}: {e}")
+                logger.warning("Groq JSON failed | type=%s | msg=%s", type(e).__name__, e)
+        else:
+            _failures.append("groq: circuit breaker OPEN")
             logger.info("CircuitBreaker[groq]: OPEN — skipping Groq for JSON")
 
-        # Fallback 2: Ollama
+        # ── Ollama ───────────────────────────────────────────────────────────
         if _cb_ollama.can_attempt():
             try:
                 logger.info("Falling back to Ollama for JSON...")
@@ -417,11 +491,22 @@ class AIService:
                 return result
             except Exception as e:
                 _cb_ollama.record_failure()
-                logger.error(f"All AI backends failed for JSON: {e}")
+                _failures.append(f"ollama: {type(e).__name__}: {e}")
+                logger.error(
+                    "All AI backends failed for JSON | failures=%s",
+                    " | ".join(_failures),
+                )
         else:
-            logger.error("CircuitBreaker[ollama]: OPEN — all providers unavailable")
+            _failures.append("ollama: circuit breaker OPEN")
+            logger.error(
+                "All AI backends unavailable for JSON | failures=%s",
+                " | ".join(_failures),
+            )
 
-        return {}
+        raise HTTPException(
+            status_code=503,
+            detail="AI service temporarily unavailable. Please try again.",
+        )
 
     async def generate_text(self, prompt: str) -> str:
         """Returns a plain-text response from the LLM."""
@@ -508,13 +593,11 @@ class AIService:
 
     async def generate_json_strict(self, prompt: str) -> Dict[str, Any]:
         """
-        Like generate_json but raises an exception if all providers fail
-        instead of returning an empty dict. Use for critical paths.
+        Like generate_json but always raises on failure.
+        generate_json now raises HTTPException(503) itself, so this is
+        a direct passthrough kept for backwards compat.
         """
-        result = await self.generate_json(prompt)
-        if not result:
-            raise RuntimeError("All AI providers failed to generate JSON response")
-        return result
+        return await self.generate_json(prompt)
 
 
 # Singleton instance — import this everywhere

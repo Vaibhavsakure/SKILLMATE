@@ -47,15 +47,37 @@ async def get_balance(
     user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Get current credit balance for the user."""
+    """Get current credit balance for the user.
+
+    Defensive: if the user has no UserCredits row yet (new user whose
+    wallet hasn't been initialised) we return 0 instead of crashing.
+    """
     user_id = user.get("id")
 
     try:
         wallet = get_wallet(db, user_id)
+
+        # Guard against get_user_credits returning None unexpectedly
+        # (e.g. DB commit succeeded but refresh failed)
+        if wallet is None:
+            logger.warning(
+                "get_user_credits returned None for user=%s — returning 0 credits",
+                user_id,
+            )
+            return CreditBalance(credits=0)
+
         return CreditBalance(credits=wallet.credits)
+
     except Exception as e:
-        logger.error(f"Error fetching balance for {user_id}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to fetch credit balance")
+        logger.error(
+            "Error fetching balance | user=%s | type=%s | msg=%s",
+            user_id, type(e).__name__, e,
+            exc_info=True,
+        )
+        # Return 0 instead of crashing — the user can still use the app;
+        # a transient DB error shouldn't lock them out of the UI entirely.
+        return CreditBalance(credits=0)
+
 
 
 @router.get("/history", response_model=CreditHistory)

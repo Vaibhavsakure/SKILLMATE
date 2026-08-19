@@ -119,7 +119,7 @@ export function initMonitoring(): void {
       if (
         errorMessage.includes("ResizeObserver loop") ||
         errorMessage.includes("Non-Error promise rejection") ||
-        errorMessage.includes("Network Error") && environment === "development"
+        (errorMessage.includes("Network Error") && environment === "development")
       ) {
         return null;
       }

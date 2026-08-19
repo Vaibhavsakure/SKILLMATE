@@ -1,5 +1,5 @@
-"""
-Admin Analytics API — Usage tracking and admin dashboard data.
+﻿"""
+Admin Analytics API ΓÇö Usage tracking and admin dashboard data.
 """
 
 import logging
@@ -49,7 +49,7 @@ async def get_admin_analytics(
 ):
     """Returns aggregated analytics for the admin dashboard.
 
-    Requires superuser access — this aggregates every user's activity, so it
+    Requires superuser access ΓÇö this aggregates every user's activity, so it
     is gated by require_admin rather than plain authentication.
     """
 

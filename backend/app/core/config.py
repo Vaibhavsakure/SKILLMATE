@@ -1,5 +1,5 @@
-"""
-Skillmate Backend — Centralized Settings
+﻿"""
+Skillmate Backend ΓÇö Centralized Settings
 ==========================================
 All environment variables flow through here via pydantic-settings.
 
@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     # --- General ---
     app_name: str = "Skillmate API"
     env: str = "development"  # "development" | "staging" | "production"
-    debug: bool = False  # Safe default — only True when explicitly set
+    debug: bool = False  # Safe default ΓÇö only True when explicitly set
 
     # --- Security ---
     cors_origins: List[str] = ["http://localhost:3000", "http://127.0.0.1:3000"]
@@ -31,7 +31,7 @@ class Settings(BaseSettings):
         "Authorization", "Content-Type", "Accept", "Origin",
         "X-Requested-With", "X-Request-ID",
     ]
-    secret_key: str = ""  # REQUIRED in production — auto-generated in dev
+    secret_key: str = ""  # REQUIRED in production ΓÇö auto-generated in dev
     frontend_url: str = "http://localhost:3000"  # Used for Stripe redirects, emails, etc.
 
     # --- Database (PostgreSQL or SQLite fallback) ---
@@ -48,7 +48,7 @@ class Settings(BaseSettings):
     groq_api_key: Optional[str] = None
     gemini_api_key: Optional[str] = None
 
-    # --- Ollama (Local LLM — optional fallback) ---
+    # --- Ollama (Local LLM ΓÇö optional fallback) ---
     ollama_base_url: str = "http://localhost:11434"
 
     # --- Redis (response cache + ARQ task queue) ---
@@ -128,21 +128,21 @@ _logger = logging.getLogger("skillmate.config")
 if not settings.secret_key:
     if settings.is_production:
         raise RuntimeError(
-            "❌ FATAL: SECRET_KEY is required in production. "
+            "Γ¥î FATAL: SECRET_KEY is required in production. "
             "Set it to a random string (64+ chars): python -c \"import secrets; print(secrets.token_urlsafe(64))\""
         )
     settings.secret_key = secrets.token_urlsafe(48)
-    _logger.warning("⚠️ SECRET_KEY not set — auto-generated for development. Set SECRET_KEY in .env for production.")
+    _logger.warning("ΓÜá∩╕Å SECRET_KEY not set ΓÇö auto-generated for development. Set SECRET_KEY in .env for production.")
 
 # Warn about insecure defaults in production
 if settings.is_production:
     if "sqlite" in settings.database_url:
-        _logger.critical("❌ SQLite detected in production! Set DATABASE_URL to PostgreSQL.")
+        _logger.critical("Γ¥î SQLite detected in production! Set DATABASE_URL to PostgreSQL.")
     if not settings.supabase_url:
-        _logger.critical("❌ SUPABASE_URL not configured in production!")
+        _logger.critical("Γ¥î SUPABASE_URL not configured in production!")
     if not settings.stripe_webhook_secret:
-        _logger.warning("⚠️ STRIPE_WEBHOOK_SECRET not set — webhooks will not be verified!")
+        _logger.warning("ΓÜá∩╕Å STRIPE_WEBHOOK_SECRET not set ΓÇö webhooks will not be verified!")
     if settings.allow_dev_mock_auth:
-        raise RuntimeError("❌ FATAL: ALLOW_DEV_MOCK_AUTH must be False in production!")
+        raise RuntimeError("Γ¥î FATAL: ALLOW_DEV_MOCK_AUTH must be False in production!")
     if any(origin in settings.cors_origins for origin in ["http://localhost:3000", "http://127.0.0.1:3000"]):
-        _logger.warning("⚠️ localhost CORS origin detected in production. Remove for security.")
+        _logger.warning("ΓÜá∩╕Å localhost CORS origin detected in production. Remove for security.")

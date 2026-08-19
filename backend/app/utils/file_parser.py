@@ -1,4 +1,4 @@
-import PyPDF2
+﻿import PyPDF2
 import docx
 import io
 import logging
@@ -16,7 +16,7 @@ MAX_FILE_SIZE = settings.max_file_size_mb * 1024 * 1024
 # controlled, so a ".pdf" that is really a script or a zip bomb would otherwise
 # be handed straight to the parsers. app.core.security.validate_upload_file
 # implements the same check but is not called by any route, so the enforcement
-# lives here — every upload endpoint funnels through extract_text_from_file.
+# lives here ΓÇö every upload endpoint funnels through extract_text_from_file.
 FILE_SIGNATURES = {
     "pdf": [b"%PDF"],
     "docx": [b"PK\x03\x04"],          # DOCX is a ZIP archive

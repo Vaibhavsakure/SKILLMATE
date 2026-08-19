@@ -1,5 +1,5 @@
-"""
-Skillmate AI Backend — Main Application
+﻿"""
+Skillmate AI Backend ΓÇö Main Application
 =========================================
 """
 
@@ -18,7 +18,7 @@ from slowapi.errors import RateLimitExceeded
 from app.core.config import settings
 from app.core.security import SecurityHeadersMiddleware, RequestIDMiddleware
 
-# ── Monitoring: configure logging FIRST, before any other imports ──
+# ΓöÇΓöÇ Monitoring: configure logging FIRST, before any other imports ΓöÇΓöÇ
 from app.core.logger import configure_logging, get_logger, RequestLoggingMiddleware
 from app.core.monitoring import init_sentry, get_metrics
 from app.core.docs import configure_openapi
@@ -75,7 +75,7 @@ limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"])
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # ── Sentry: init before anything else that could raise ──
+    # ΓöÇΓöÇ Sentry: init before anything else that could raise ΓöÇΓöÇ
     _sentry_dsn = getattr(settings, "sentry_dsn", None) or ""
     _sentry_ok = init_sentry(
         dsn=_sentry_dsn,
@@ -118,7 +118,7 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # --- Security Middlewares (order matters: last added = first executed) ---
-# 1. CORS — explicit origins, methods, and headers (no wildcards)
+# 1. CORS ΓÇö explicit origins, methods, and headers (no wildcards)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
@@ -231,7 +231,7 @@ app.include_router(
     tags=["Export"],
 )
 
-# 14. Resume Parse (file upload → text extraction only)
+# 14. Resume Parse (file upload ΓåÆ text extraction only)
 app.include_router(
     resume_parse.router,
     prefix="/api/v1/resume",
@@ -350,7 +350,7 @@ app.include_router(
 )
 
 
-# ── OpenAPI / Swagger documentation ──────────────────────────────────────────
+# ΓöÇΓöÇ OpenAPI / Swagger documentation ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 # Must be called AFTER all routers are registered.
 configure_openapi(app)
 
@@ -393,7 +393,7 @@ def read_root():
 @app.get("/health")
 def health_check():
     """
-    Deep health check — verifies actual connectivity to all services.
+    Deep health check ΓÇö verifies actual connectivity to all services.
     Returns 200 if all critical services are healthy, 503 if any critical service is down.
     """
     from fastapi.responses import JSONResponse

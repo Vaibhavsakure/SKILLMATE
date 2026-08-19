@@ -8,7 +8,7 @@ raise, so a downstream SMTP outage can never crash a request handler.
 
 Usage:
     from app.services.email_service import email_service
-    await email_service.send_welcome_email("user@example.com", "Alice")
+    await email_service.send_welcome("user@example.com", "Alice")
 
 Requires in .env:
     SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, EMAIL_FROM
@@ -127,14 +127,14 @@ class EmailService:
             return True
 
         except Exception as exc:
-            logger.error(
+            logger.warning(
                 f"📧 Email FAILED: to={to_email} subject={subject!r} error={exc}"
             )
             return False
 
     # ── Public convenience methods ─────────────────────────────────────────
 
-    async def send_welcome_email(self, to_email: str, name: str) -> bool:
+    async def send_welcome(self, to_email: str, name: str) -> bool:
         """
         Sent once when a new user account is created.
         """
@@ -163,7 +163,7 @@ class EmailService:
         to_email: str,
         name: str,
         credits: int,
-        amount: str,
+        amount_usd: str,
     ) -> bool:
         """
         Confirmation after a successful credit purchase via Stripe.
@@ -181,7 +181,7 @@ class EmailService:
   </tr>
   <tr>
     <td style="padding:12px 16px;background:#1e1e38;border-radius:0 0 8px 8px;color:{_MUTED};font-size:13px;">Amount Paid</td>
-    <td style="padding:12px 16px;background:#1e1e38;border-radius:0 0 8px 8px;text-align:right;color:#fff;font-weight:700;font-size:18px;">{amount}</td>
+    <td style="padding:12px 16px;background:#1e1e38;border-radius:0 0 8px 8px;text-align:right;color:#fff;font-weight:700;font-size:18px;">{amount_usd}</td>
   </tr>
 </table>
 <p>Your updated balance is reflected on your dashboard.</p>
@@ -209,7 +209,7 @@ class EmailService:
 
         return await self._send(to_email, "Reset Your Skillmate AI Password", _base_html("Password Reset", body))
 
-    async def send_recruiter_match_alert(
+    async def send_recruiter_match(
         self,
         to_email: str,
         candidate_name: str,
@@ -256,6 +256,146 @@ class EmailService:
             to_email,
             f"🎯 Candidate Match: {candidate_name} ({score}%) for {job_title}",
             _base_html("Candidate Match", body),
+        )
+
+    async def send_credit_low(
+        self,
+        to_email: str,
+        name: str,
+        remaining: int,
+    ) -> bool:
+        """
+        Sent when a user's credit balance drops below 5 after a tool use.
+        """
+        first_name = name.split()[0] if name else "there"
+        credits_url = f"{settings.frontend_url}/dashboard/credits"
+
+        body = f"""\
+<h2 style="margin:0 0 16px;color:#fff;font-size:22px;">Running Low on Credits ⚠️</h2>
+<p>Hey {first_name}, you only have <strong style="color:#fdcb6e;">{remaining} credit{"s" if remaining != 1 else ""}</strong> left.</p>
+<p>Credits power every AI tool on Skillmate — resume rewrites, ATS scans,
+   interview coaching, and more. Top up now to keep your momentum going.</p>
+<table style="width:100%;border-collapse:collapse;margin:20px 0;">
+  <tr>
+    <td style="padding:16px;background:#2d2d4a;border-radius:8px;text-align:center;">
+      <span style="font-size:36px;font-weight:700;color:#fdcb6e;">{remaining}</span><br>
+      <span style="color:{_MUTED};font-size:13px;">credits remaining</span>
+    </td>
+  </tr>
+</table>
+{_button(credits_url, "Top Up Credits →")}
+<p style="color:{_MUTED};font-size:13px;">
+  Starter Pack (50 credits · $5) &nbsp;·&nbsp; Pro Pack (120 credits · $10) &nbsp;·&nbsp; Premium Pack (300 credits · $20)
+</p>"""
+
+        return await self._send(
+            to_email,
+            f"⚠️ Only {remaining} credit{'s' if remaining != 1 else ''} left — Top up now",
+            _base_html("Low Credits", body),
+        )
+
+    async def send_career_roadmap_ready(
+        self,
+        to_email: str,
+        name: str,
+    ) -> bool:
+        """
+        Sent when the background career roadmap job completes.
+        """
+        first_name = name.split()[0] if name else "there"
+        roadmap_url = f"{settings.frontend_url}/dashboard/roadmap"
+
+        body = f"""\
+<h2 style="margin:0 0 16px;color:#fff;font-size:22px;">Your Career Roadmap is Ready 🗺️</h2>
+<p>Hey {first_name}! Your personalised career roadmap has been generated and is waiting for you.</p>
+<p>Inside your roadmap you'll find:</p>
+<ul style="padding-left:20px;">
+  <li>Step-by-step milestones tailored to your target role</li>
+  <li>Curated learning resources for each stage</li>
+  <li>Estimated timelines to keep you on track</li>
+  <li>Skill gap analysis based on your current experience</li>
+</ul>
+{_button(roadmap_url, "View My Roadmap →")}
+<p style="color:{_MUTED};font-size:13px;">
+  Your roadmap is saved in your dashboard — you can revisit it anytime.
+</p>"""
+
+        return await self._send(
+            to_email,
+            "✦ Your Career Roadmap is Ready",
+            _base_html("Career Roadmap Ready", body),
+        )
+
+    async def send_weekly_digest(
+        self,
+        to_email: str,
+        name: str,
+        stats: dict,
+    ) -> bool:
+        """
+        Weekly digest email with the user's 7-day usage summary.
+
+        stats dict keys (all optional — defaults to 0 if missing):
+            tools_used      int   — total tool invocations
+            credits_spent   int   — credits consumed
+            credits_balance int   — current balance
+            top_tool        str   — most-used tool name
+            ats_scores      list  — list of recent ATS scores (int)
+        """
+        first_name = name.split()[0] if name else "there"
+        dashboard_url = f"{settings.frontend_url}/dashboard"
+
+        tools_used      = stats.get("tools_used", 0)
+        credits_spent   = stats.get("credits_spent", 0)
+        credits_balance = stats.get("credits_balance", 0)
+        top_tool        = stats.get("top_tool", "—")
+        ats_scores      = stats.get("ats_scores", [])
+
+        # Build ATS score badge row if scores exist
+        ats_row = ""
+        if ats_scores:
+            avg_score = round(sum(ats_scores) / len(ats_scores))
+            color = "#00b894" if avg_score >= 70 else "#fdcb6e" if avg_score >= 50 else "#e17055"
+            ats_row = f"""
+  <tr>
+    <td style="padding:10px 16px;background:#1e1e38;color:{_MUTED};font-size:13px;">Avg ATS Score</td>
+    <td style="padding:10px 16px;background:#1e1e38;text-align:right;">
+      <span style="color:{color};font-weight:700;">{avg_score}%</span>
+    </td>
+  </tr>"""
+
+        body = f"""\
+<h2 style="margin:0 0 16px;color:#fff;font-size:22px;">Your Weekly Recap 📊</h2>
+<p>Hey {first_name}, here's what you accomplished on Skillmate AI this week:</p>
+<table style="width:100%;border-collapse:collapse;margin:20px 0;">
+  <tr>
+    <td style="padding:10px 16px;background:#222240;border-radius:8px 8px 0 0;color:{_MUTED};font-size:13px;">Tools Used</td>
+    <td style="padding:10px 16px;background:#222240;border-radius:8px 8px 0 0;text-align:right;color:#fff;font-weight:700;">{tools_used}</td>
+  </tr>
+  <tr>
+    <td style="padding:10px 16px;background:#1e1e38;color:{_MUTED};font-size:13px;">Credits Spent</td>
+    <td style="padding:10px 16px;background:#1e1e38;text-align:right;color:#fff;font-weight:700;">{credits_spent}</td>
+  </tr>
+  <tr>
+    <td style="padding:10px 16px;background:#222240;color:{_MUTED};font-size:13px;">Credits Remaining</td>
+    <td style="padding:10px 16px;background:#222240;text-align:right;color:#fff;font-weight:700;">{credits_balance}</td>
+  </tr>
+  <tr>
+    <td style="padding:10px 16px;background:#1e1e38;color:{_MUTED};font-size:13px;">Most Used Tool</td>
+    <td style="padding:10px 16px;background:#1e1e38;text-align:right;color:#fff;font-weight:600;">{top_tool}</td>
+  </tr>{ats_row}
+</table>
+{"<p>🔥 Great work — you're building momentum! Keep going.</p>" if tools_used >= 5 else "<p>💡 <strong>Tip:</strong> Try the ATS Scanner this week — it only takes 30 seconds to check your resume.</p>"}
+{_button(dashboard_url, "Open Dashboard →")}
+<p style="color:{_MUTED};font-size:13px;">
+  You receive this digest every Monday. We'll never send more than one per week.<br>
+  <a href="{settings.frontend_url}/settings/notifications" style="color:{_MUTED};">Manage notification preferences</a>
+</p>"""
+
+        return await self._send(
+            to_email,
+            "✦ Your Skillmate AI Weekly Recap",
+            _base_html("Weekly Digest", body),
         )
 
 
