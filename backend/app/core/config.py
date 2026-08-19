@@ -1,4 +1,4 @@
-﻿"""
+"""
 Skillmate Backend ΓÇö Centralized Settings
 ==========================================
 All environment variables flow through here via pydantic-settings.
@@ -45,7 +45,9 @@ class Settings(BaseSettings):
 
     # --- AI Providers ---
     anthropic_api_key: Optional[str] = None
+    anthropic_model: str = "claude-3-5-haiku-20241022"
     groq_api_key: Optional[str] = None
+    groq_model: str = "openai/gpt-oss-120b"
     gemini_api_key: Optional[str] = None
 
     # --- Ollama (Local LLM ΓÇö optional fallback) ---
